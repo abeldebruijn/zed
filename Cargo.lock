@@ -21893,6 +21893,7 @@ dependencies = [
  "project_symbols",
  "prompt_store",
  "proto",
+ "pull_request_panel",
  "rayon",
  "recent_projects",
  "release_channel",
