@@ -64,9 +64,61 @@ pub struct PullRequestPanel {
     load_task: Option<Task<()>>,
     load_generation: usize,
     active_repository_id: Option<EntityId>,
-    visible_pull_request_count: usize,
+    visible_pull_request_counts: VisiblePullRequestCounts,
     view_state: PullRequestPanelViewState,
     collapsed_sections: HashSet<list::PullRequestSection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VisiblePullRequestCounts {
+    copilot_on_my_behalf: usize,
+    local_pull_request_branches: usize,
+    waiting_for_my_review: usize,
+    created_by_me: usize,
+    all_open: usize,
+}
+
+impl Default for VisiblePullRequestCounts {
+    fn default() -> Self {
+        Self {
+            copilot_on_my_behalf: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+            local_pull_request_branches: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+            waiting_for_my_review: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+            created_by_me: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+            all_open: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+        }
+    }
+}
+
+impl VisiblePullRequestCounts {
+    fn for_section(&self, section: list::PullRequestSection) -> usize {
+        match section {
+            list::PullRequestSection::CopilotOnMyBehalf => self.copilot_on_my_behalf,
+            list::PullRequestSection::LocalPullRequestBranches => self.local_pull_request_branches,
+            list::PullRequestSection::WaitingForMyReview => self.waiting_for_my_review,
+            list::PullRequestSection::CreatedByMe => self.created_by_me,
+            list::PullRequestSection::AllOpen => self.all_open,
+        }
+    }
+
+    fn for_section_mut(&mut self, section: list::PullRequestSection) -> &mut usize {
+        match section {
+            list::PullRequestSection::CopilotOnMyBehalf => &mut self.copilot_on_my_behalf,
+            list::PullRequestSection::LocalPullRequestBranches => {
+                &mut self.local_pull_request_branches
+            }
+            list::PullRequestSection::WaitingForMyReview => &mut self.waiting_for_my_review,
+            list::PullRequestSection::CreatedByMe => &mut self.created_by_me,
+            list::PullRequestSection::AllOpen => &mut self.all_open,
+        }
+    }
+
+    fn load_more(&mut self, section: list::PullRequestSection, total_pull_request_count: usize) {
+        let visible_pull_request_count = self.for_section_mut(section);
+        *visible_pull_request_count = visible_pull_request_count
+            .saturating_add(LOAD_MORE_PULL_REQUEST_COUNT)
+            .min(total_pull_request_count);
+    }
 }
 
 impl PullRequestPanel {
@@ -122,7 +174,7 @@ impl PullRequestPanel {
                 load_task: None,
                 load_generation: 0,
                 active_repository_id: None,
-                visible_pull_request_count: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+                visible_pull_request_counts: VisiblePullRequestCounts::default(),
                 view_state: PullRequestPanelViewState::loading(),
                 collapsed_sections: Self::default_collapsed_sections(),
             }
@@ -156,7 +208,7 @@ impl PullRequestPanel {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        self.visible_pull_request_count = INITIAL_VISIBLE_PULL_REQUEST_COUNT;
+        self.visible_pull_request_counts = VisiblePullRequestCounts::default();
 
         let Some(workspace) = self.workspace.upgrade() else {
             self.active_repository_id = None;
@@ -227,25 +279,18 @@ impl PullRequestPanel {
             && self.collapsed_sections.len() < list::PullRequestSection::ordered().len()
     }
 
-    fn load_more_pull_requests(&mut self, cx: &mut Context<Self>) {
+    fn load_more_pull_requests(
+        &mut self,
+        section: list::PullRequestSection,
+        cx: &mut Context<Self>,
+    ) {
         let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
             return;
         };
 
-        self.visible_pull_request_count = self
-            .visible_pull_request_count
-            .saturating_add(LOAD_MORE_PULL_REQUEST_COUNT)
-            .min(data.total_pull_request_count());
+        self.visible_pull_request_counts
+            .load_more(section, data.sections.pull_request_count(section));
         cx.notify();
-    }
-
-    fn can_load_more_pull_requests(&self) -> bool {
-        match &self.view_state.content {
-            PullRequestPanelContent::Ready(data) => {
-                self.visible_pull_request_count < data.total_pull_request_count()
-            }
-            _ => false,
-        }
     }
 }
 
@@ -400,8 +445,11 @@ impl PullRequestPanelData {
         self.sections.all_open.len()
     }
 
-    fn visible_sections(&self, visible_pull_request_count: usize) -> CategorizedPullRequests {
-        self.sections.limit(visible_pull_request_count)
+    fn visible_sections(
+        &self,
+        visible_pull_request_counts: &VisiblePullRequestCounts,
+    ) -> CategorizedPullRequests {
+        self.sections.limit(visible_pull_request_counts)
     }
 }
 
@@ -439,41 +487,43 @@ struct CategorizedPullRequests {
 }
 
 impl CategorizedPullRequests {
-    fn limit(&self, visible_pull_request_count: usize) -> Self {
-        if visible_pull_request_count >= self.all_open.len() {
-            return self.clone();
-        }
-
-        let visible_pull_request_numbers = self
-            .all_open
-            .iter()
-            .take(visible_pull_request_count)
-            .map(|pull_request| pull_request.number)
-            .collect::<HashSet<_>>();
-
+    fn limit(&self, visible_pull_request_counts: &VisiblePullRequestCounts) -> Self {
         Self {
             copilot_on_my_behalf: limit_pull_request_summaries(
                 &self.copilot_on_my_behalf,
-                &visible_pull_request_numbers,
+                visible_pull_request_counts
+                    .for_section(list::PullRequestSection::CopilotOnMyBehalf),
             ),
             local_pull_request_branches: limit_pull_request_summaries(
                 &self.local_pull_request_branches,
-                &visible_pull_request_numbers,
+                visible_pull_request_counts
+                    .for_section(list::PullRequestSection::LocalPullRequestBranches),
             ),
             waiting_for_my_review: limit_pull_request_summaries(
                 &self.waiting_for_my_review,
-                &visible_pull_request_numbers,
+                visible_pull_request_counts
+                    .for_section(list::PullRequestSection::WaitingForMyReview),
             ),
             created_by_me: limit_pull_request_summaries(
                 &self.created_by_me,
-                &visible_pull_request_numbers,
+                visible_pull_request_counts.for_section(list::PullRequestSection::CreatedByMe),
             ),
-            all_open: self
-                .all_open
-                .iter()
-                .take(visible_pull_request_count)
-                .cloned()
-                .collect(),
+            all_open: limit_pull_request_summaries(
+                &self.all_open,
+                visible_pull_request_counts.for_section(list::PullRequestSection::AllOpen),
+            ),
+        }
+    }
+
+    fn pull_request_count(&self, section: list::PullRequestSection) -> usize {
+        match section {
+            list::PullRequestSection::CopilotOnMyBehalf => self.copilot_on_my_behalf.len(),
+            list::PullRequestSection::LocalPullRequestBranches => {
+                self.local_pull_request_branches.len()
+            }
+            list::PullRequestSection::WaitingForMyReview => self.waiting_for_my_review.len(),
+            list::PullRequestSection::CreatedByMe => self.created_by_me.len(),
+            list::PullRequestSection::AllOpen => self.all_open.len(),
         }
     }
 }
@@ -749,11 +799,11 @@ fn sort_pull_request_summaries(pull_requests: &mut [PullRequestSummary]) {
 
 fn limit_pull_request_summaries(
     pull_requests: &[PullRequestSummary],
-    visible_pull_request_numbers: &HashSet<u64>,
+    visible_pull_request_count: usize,
 ) -> Vec<PullRequestSummary> {
     pull_requests
         .iter()
-        .filter(|pull_request| visible_pull_request_numbers.contains(&pull_request.number))
+        .take(visible_pull_request_count)
         .cloned()
         .collect()
 }
@@ -937,7 +987,14 @@ mod tests {
 
         let sections =
             categorize_pull_requests(pull_requests, Some("abeldebruijn"), &local_branch_names);
-        let limited_sections = sections.limit(2);
+        let visible_pull_request_counts = VisiblePullRequestCounts {
+            copilot_on_my_behalf: 1,
+            local_pull_request_branches: 1,
+            waiting_for_my_review: 2,
+            created_by_me: 1,
+            all_open: 2,
+        };
+        let limited_sections = sections.limit(&visible_pull_request_counts);
 
         assert_eq!(
             limited_sections
@@ -953,7 +1010,7 @@ mod tests {
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![2, 1]
+            vec![2]
         );
         assert_eq!(
             limited_sections
@@ -961,7 +1018,7 @@ mod tests {
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![1, 3]
         );
         assert_eq!(
             limited_sections
@@ -978,6 +1035,101 @@ mod tests {
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
             vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn categorized_pull_requests_limit_defaults_to_initial_count_for_each_section() {
+        let section_pull_requests = (1..=25)
+            .map(|number| {
+                pull_request(
+                    number,
+                    "abeldebruijn",
+                    "branch",
+                    &[],
+                    "2026-03-10T12:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let sections = CategorizedPullRequests {
+            copilot_on_my_behalf: section_pull_requests.clone(),
+            local_pull_request_branches: section_pull_requests.clone(),
+            waiting_for_my_review: section_pull_requests.clone(),
+            created_by_me: section_pull_requests.clone(),
+            all_open: section_pull_requests,
+        };
+
+        let limited_sections = sections.limit(&VisiblePullRequestCounts::default());
+
+        assert_eq!(
+            limited_sections.copilot_on_my_behalf.len(),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            limited_sections.local_pull_request_branches.len(),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            limited_sections.waiting_for_my_review.len(),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            limited_sections.created_by_me.len(),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            limited_sections.all_open.len(),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+    }
+
+    #[test]
+    fn visible_pull_request_counts_default_to_initial_count_for_every_section() {
+        let visible_pull_request_counts = VisiblePullRequestCounts::default();
+
+        assert!(
+            list::PullRequestSection::ordered()
+                .into_iter()
+                .all(|section| {
+                    visible_pull_request_counts.for_section(section)
+                        == INITIAL_VISIBLE_PULL_REQUEST_COUNT
+                })
+        );
+    }
+
+    #[test]
+    fn visible_pull_request_counts_load_more_only_updates_requested_section() {
+        let mut visible_pull_request_counts = VisiblePullRequestCounts::default();
+
+        visible_pull_request_counts.load_more(list::PullRequestSection::CreatedByMe, 45);
+
+        assert_eq!(
+            visible_pull_request_counts.for_section(list::PullRequestSection::CreatedByMe),
+            40
+        );
+        assert_eq!(
+            visible_pull_request_counts.for_section(list::PullRequestSection::CopilotOnMyBehalf),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            visible_pull_request_counts
+                .for_section(list::PullRequestSection::LocalPullRequestBranches),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            visible_pull_request_counts.for_section(list::PullRequestSection::WaitingForMyReview),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+        assert_eq!(
+            visible_pull_request_counts.for_section(list::PullRequestSection::AllOpen),
+            INITIAL_VISIBLE_PULL_REQUEST_COUNT
+        );
+
+        visible_pull_request_counts.load_more(list::PullRequestSection::CreatedByMe, 35);
+
+        assert_eq!(
+            visible_pull_request_counts.for_section(list::PullRequestSection::CreatedByMe),
+            35
         );
     }
 

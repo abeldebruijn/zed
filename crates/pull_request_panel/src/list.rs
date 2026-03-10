@@ -118,7 +118,7 @@ fn render_ready_state(
     data: &PullRequestPanelData,
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
-    let visible_sections = data.visible_sections(panel.visible_pull_request_count);
+    let visible_sections = data.visible_sections(&panel.visible_pull_request_counts);
     let visible_pull_request_count = visible_sections.all_open.len();
     let total_pull_request_count = data.total_pull_request_count();
 
@@ -144,24 +144,30 @@ fn render_ready_state(
                 v_flex().w_full().gap_1().children(
                     PullRequestSection::ordered()
                         .into_iter()
-                        .map(|section| render_section(panel, section, &visible_sections, cx)),
+                        .map(|section| {
+                            render_section(panel, section, &data.sections, &visible_sections, cx)
+                        }),
                 ),
             ),
         )
-        .when(panel.can_load_more_pull_requests(), |this| {
-            this.child(render_load_more_button(cx))
-        })
         .into_any_element()
 }
 
 fn render_section(
     panel: &PullRequestPanel,
     section: PullRequestSection,
-    sections: &CategorizedPullRequests,
+    all_sections: &CategorizedPullRequests,
+    visible_sections: &CategorizedPullRequests,
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
     let is_collapsed = panel.collapsed_sections.contains(&section);
-    let pull_requests = section.pull_requests(sections);
+    let pull_requests = section.pull_requests(visible_sections);
+    let should_render_load_more_button = should_render_section_load_more_button(
+        section,
+        is_collapsed,
+        visible_sections,
+        all_sections,
+    );
 
     v_flex()
         .id(format!("pull-request-section-{}", section.id()))
@@ -177,29 +183,46 @@ fn render_section(
                 .inset(true),
         )
         .when(!is_collapsed, |section_list| {
-            section_list.children(if pull_requests.is_empty() {
-                vec![render_empty_row(section)]
-            } else {
-                pull_requests
-                    .iter()
-                    .map(|pull_request| render_pull_request_row(section, pull_request))
-                    .collect()
-            })
+            section_list
+                .children(if pull_requests.is_empty() {
+                    vec![render_empty_row(section)]
+                } else {
+                    pull_requests
+                        .iter()
+                        .map(|pull_request| render_pull_request_row(section, pull_request))
+                        .collect()
+                })
+                .when(should_render_load_more_button, |section_list| {
+                    section_list.child(render_load_more_button(section, cx))
+                })
         })
         .into_any_element()
 }
 
-fn render_load_more_button(cx: &mut Context<PullRequestPanel>) -> AnyElement {
+fn should_render_section_load_more_button(
+    section: PullRequestSection,
+    is_collapsed: bool,
+    visible_sections: &CategorizedPullRequests,
+    all_sections: &CategorizedPullRequests,
+) -> bool {
+    !is_collapsed
+        && section.pull_requests(visible_sections).len() < section.pull_requests(all_sections).len()
+}
+
+fn render_load_more_button(
+    section: PullRequestSection,
+    cx: &mut Context<PullRequestPanel>,
+) -> AnyElement {
     div()
-        .pt_2()
-        .border_t_1()
-        .border_color(cx.theme().colors().border_variant)
         .child(
-            Button::new("pull-request-load-more", "Load more")
-                .style(ButtonStyle::Subtle)
-                .label_size(LabelSize::Small)
-                .full_width()
-                .on_click(cx.listener(|this, _, _, cx| this.load_more_pull_requests(cx))),
+            Button::new(
+                format!("pull-request-load-more-{}", section.id()),
+                "Load more",
+            )
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .full_width()
+            .on_click(cx.listener(move |this, _, _, cx| this.load_more_pull_requests(section, cx))),
         )
         .into_any_element()
 }
@@ -261,7 +284,20 @@ fn section_count_label(count: usize) -> Label {
 
 #[cfg(test)]
 mod tests {
-    use super::PullRequestSection;
+    use super::{PullRequestSection, should_render_section_load_more_button};
+    use crate::{CategorizedPullRequests, PullRequestSummary};
+
+    fn pull_request(number: u64) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: format!("PR {number}"),
+            html_url: format!("https://example.com/pull/{number}"),
+            author_login: "abeldebruijn".to_string(),
+            head_ref: format!("branch-{number}"),
+            requested_reviewer_logins: Vec::new(),
+            updated_at: "2026-03-10T12:00:00Z".parse().unwrap(),
+        }
+    }
 
     #[test]
     fn ordered_sections_match_requested_screenshot_order() {
@@ -280,5 +316,49 @@ mod tests {
                 "All Open",
             ]
         );
+    }
+
+    #[test]
+    fn section_load_more_button_renders_when_section_has_hidden_pull_requests() {
+        let all_sections = CategorizedPullRequests {
+            created_by_me: vec![pull_request(1), pull_request(2)],
+            ..Default::default()
+        };
+        let visible_sections = CategorizedPullRequests {
+            created_by_me: vec![pull_request(1)],
+            ..Default::default()
+        };
+
+        assert!(should_render_section_load_more_button(
+            PullRequestSection::CreatedByMe,
+            false,
+            &visible_sections,
+            &all_sections,
+        ));
+    }
+
+    #[test]
+    fn section_load_more_button_is_hidden_when_section_is_collapsed_or_fully_visible() {
+        let all_sections = CategorizedPullRequests {
+            all_open: vec![pull_request(1), pull_request(2)],
+            ..Default::default()
+        };
+        let visible_sections = CategorizedPullRequests {
+            all_open: vec![pull_request(1)],
+            ..Default::default()
+        };
+
+        assert!(!should_render_section_load_more_button(
+            PullRequestSection::AllOpen,
+            true,
+            &visible_sections,
+            &all_sections,
+        ));
+        assert!(!should_render_section_load_more_button(
+            PullRequestSection::AllOpen,
+            false,
+            &all_sections,
+            &all_sections,
+        ));
     }
 }
