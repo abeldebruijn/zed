@@ -292,7 +292,7 @@ mod tests {
             number,
             title: format!("PR {number}"),
             html_url: format!("https://example.com/pull/{number}"),
-            author_login: "abeldebruijn".to_string(),
+            author_login: "octocat".to_string(),
             head_ref: format!("branch-{number}"),
             requested_reviewer_logins: Vec::new(),
             updated_at: "2026-03-10T12:00:00Z".parse().unwrap(),

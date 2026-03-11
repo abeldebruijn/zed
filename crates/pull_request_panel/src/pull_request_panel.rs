@@ -274,6 +274,13 @@ impl PullRequestPanel {
         cx.notify();
     }
 
+    /// Returns true if the "Collapse All" action should be enabled.
+    ///
+    /// The action is only meaningful when the panel has successfully loaded data (i.e. its view
+    /// state content is `Ready`). Additionally, there must be at least one section that is
+    /// currently expanded. We detect that by comparing the number of collapsed sections to the
+    /// total number of known pull request sections — if fewer sections are collapsed than the
+    /// total, at least one section is expanded and "Collapse All" is applicable.
     fn can_collapse_all_sections(&self) -> bool {
         matches!(&self.view_state.content, PullRequestPanelContent::Ready(_))
             && self.collapsed_sections.len() < list::PullRequestSection::ordered().len()
@@ -284,6 +291,7 @@ impl PullRequestPanel {
         section: list::PullRequestSection,
         cx: &mut Context<Self>,
     ) {
+        // Guard against loading more pull requests when the panel has not yet loaded data.
         let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
             return;
         };
@@ -718,20 +726,21 @@ fn github_pull_request_request(
     http_client: &Arc<dyn HttpClient>,
     page: usize,
 ) -> Result<Request<AsyncBody>> {
+    // in the request URL. User-specific groupings are derived after fetching open pull requests.
     Request::builder()
-        .method("GET")
-        .uri(format!(
-            "{}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100&page={page}",
-            repository.api_base_url, repository.owner, repository.repo,
-        ))
-        .header("Accept", GITHUB_ACCEPT_HEADER)
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .when_some(http_client.user_agent().cloned(), |request, user_agent| {
-            request.header("User-Agent", user_agent)
-        })
-        .follow_redirects(RedirectPolicy::FollowAll)
-        .body(AsyncBody::default())
-        .context("Failed to build GitHub pull request request")
+      .method("GET")
+      .uri(format!(
+          "{}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page={INITIAL_VISIBLE_PULL_REQUEST_COUNT}&page={page}",
+          repository.api_base_url, repository.owner, repository.repo,
+      ))
+      .header("Accept", GITHUB_ACCEPT_HEADER)
+      .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+      .when_some(http_client.user_agent().cloned(), |request, user_agent| {
+          request.header("User-Agent", user_agent)
+      })
+      .follow_redirects(RedirectPolicy::FollowAll)
+      .body(AsyncBody::default())
+      .context("Failed to build GitHub pull request request")
 }
 
 fn response_has_next_page(response: &http_client::Response<AsyncBody>) -> Result<bool> {
@@ -858,21 +867,15 @@ mod tests {
                 1,
                 "copilot-swe-agent",
                 "local-feature",
-                &["abeldebruijn"],
+                &["octocat"],
                 "2026-03-09T12:00:00Z",
             ),
-            pull_request(
-                2,
-                "abeldebruijn",
-                "user-branch",
-                &[],
-                "2026-03-10T12:00:00Z",
-            ),
+            pull_request(2, "octocat", "user-branch", &[], "2026-03-10T12:00:00Z"),
             pull_request(
                 3,
                 "someone-else",
                 "remote-only",
-                &["abeldebruijn"],
+                &["octocat"],
                 "2026-03-08T12:00:00Z",
             ),
         ];
@@ -880,7 +883,7 @@ mod tests {
             HashSet::from(["local-feature".to_string(), "user-branch".to_string()]);
 
         let sections =
-            categorize_pull_requests(pull_requests, Some("abeldebruijn"), &local_branch_names);
+            categorize_pull_requests(pull_requests, Some("octocat"), &local_branch_names);
 
         assert_eq!(
             sections
@@ -930,7 +933,7 @@ mod tests {
             4,
             "someone-else",
             "local-branch",
-            &["abeldebruijn"],
+            &["octocat"],
             "2026-03-10T12:00:00Z",
         )];
         let local_branch_names = HashSet::from(["local-branch".to_string()]);
@@ -964,21 +967,15 @@ mod tests {
                 1,
                 "copilot-swe-agent",
                 "local-feature",
-                &["abeldebruijn"],
+                &["octocat"],
                 "2026-03-09T12:00:00Z",
             ),
-            pull_request(
-                2,
-                "abeldebruijn",
-                "user-branch",
-                &[],
-                "2026-03-10T12:00:00Z",
-            ),
+            pull_request(2, "octocat", "user-branch", &[], "2026-03-10T12:00:00Z"),
             pull_request(
                 3,
                 "someone-else",
                 "remote-only",
-                &["abeldebruijn"],
+                &["octocat"],
                 "2026-03-08T12:00:00Z",
             ),
         ];
@@ -986,7 +983,7 @@ mod tests {
             HashSet::from(["local-feature".to_string(), "user-branch".to_string()]);
 
         let sections =
-            categorize_pull_requests(pull_requests, Some("abeldebruijn"), &local_branch_names);
+            categorize_pull_requests(pull_requests, Some("octocat"), &local_branch_names);
         let visible_pull_request_counts = VisiblePullRequestCounts {
             copilot_on_my_behalf: 1,
             local_pull_request_branches: 1,
@@ -1041,15 +1038,7 @@ mod tests {
     #[test]
     fn categorized_pull_requests_limit_defaults_to_initial_count_for_each_section() {
         let section_pull_requests = (1..=25)
-            .map(|number| {
-                pull_request(
-                    number,
-                    "abeldebruijn",
-                    "branch",
-                    &[],
-                    "2026-03-10T12:00:00Z",
-                )
-            })
+            .map(|number| pull_request(number, "octocat", "branch", &[], "2026-03-10T12:00:00Z"))
             .collect::<Vec<_>>();
         let sections = CategorizedPullRequests {
             copilot_on_my_behalf: section_pull_requests.clone(),
