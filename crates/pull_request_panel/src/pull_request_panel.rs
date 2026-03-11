@@ -1,24 +1,27 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures::AsyncReadExt;
+use git::repository::Branch;
 use git::{GitHostingProviderRegistry, parse_git_remote_url};
-use git_ui::resolve_active_repository;
+use git_ui::{project_diff::ProjectDiff, resolve_active_repository};
 use gpui::{
-    Action, App, AppContext, AsyncWindowContext, BorrowAppContext, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render, Subscription, Task,
-    WeakEntity, Window, actions, px,
+    Action, App, AppContext, AsyncWindowContext, BorrowAppContext, Context, Corner, DismissEvent,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Point, Render,
+    Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request, StatusCode};
 use project::git_store::{GitStoreEvent, Repository, RepositoryEvent};
 use settings::SettingsStore;
 use std::{collections::HashSet, sync::Arc};
-use ui::{IconName, prelude::*, v_flex};
+use ui::{ContextMenu, IconName, prelude::*, v_flex};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::DetachAndPromptErr,
 };
 
 mod list;
+mod pull_request_context_panel;
 mod top_bar;
 
 const PULL_REQUEST_PANEL_KEY: &str = "PullRequestPanel";
@@ -132,6 +135,8 @@ pub struct PullRequestPanel {
     load_generation: usize,
     active_repository_id: Option<EntityId>,
     visible_pull_request_count: usize,
+    context_menu_pull_request: Option<PullRequestSummary>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     sort: PullRequestSort,
     sort_direction: PullRequestSortDirection,
     view_state: PullRequestPanelViewState,
@@ -199,6 +204,8 @@ impl PullRequestPanel {
                 load_generation: 0,
                 active_repository_id: None,
                 visible_pull_request_count: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+                context_menu_pull_request: None,
+                context_menu: None,
                 sort: PullRequestSort::default(),
                 sort_direction: PullRequestSortDirection::default(),
                 view_state: PullRequestPanelViewState::loading(),
@@ -235,6 +242,7 @@ impl PullRequestPanel {
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.visible_pull_request_count = INITIAL_VISIBLE_PULL_REQUEST_COUNT;
+        self.clear_context_menu();
 
         let Some(workspace) = self.workspace.upgrade() else {
             self.active_repository_id = None;
@@ -348,6 +356,183 @@ impl PullRequestPanel {
             _ => false,
         }
     }
+
+    fn deploy_pull_request_context_menu(
+        &mut self,
+        pull_request: PullRequestSummary,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity().downgrade();
+        let checkout_branch_disabled = self.checkout_branch_action_disabled(&pull_request, cx);
+        let context_menu = pull_request_context_panel::build_context_menu(
+            window,
+            cx,
+            self.focus_handle.clone(),
+            checkout_branch_disabled,
+            move |action, window, cx| {
+                let Some(panel) = panel.upgrade() else {
+                    return;
+                };
+
+                panel.update(cx, |panel, cx| {
+                    panel.handle_pull_request_context_menu_action(action, window, cx);
+                });
+            },
+        );
+
+        self.context_menu_pull_request = Some(pull_request);
+        self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    fn handle_pull_request_context_menu_action(
+        &mut self,
+        action: pull_request_context_panel::PullRequestContextMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_pull_request = self.context_menu_pull_request.clone();
+        let effect = pull_request_context_menu_effect(action, selected_pull_request.as_ref());
+        self.clear_context_menu();
+        cx.focus_self(window);
+        cx.notify();
+
+        let Some(effect) = effect else {
+            return;
+        };
+
+        match effect {
+            PullRequestContextMenuEffect::OpenInGitHub(html_url) => {
+                cx.open_url(&html_url);
+            }
+            PullRequestContextMenuEffect::CheckoutBranch(head_ref) => {
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                let Some(repository) = resolve_active_repository(&workspace.read(cx), cx) else {
+                    return;
+                };
+
+                window
+                    .spawn(cx, async move |cx| {
+                        let branches = repository
+                            .update(cx, |repository, _| repository.branches())
+                            .await??;
+                        let branch_name = branch_name_for_pull_request_head(&head_ref, &branches);
+
+                        repository
+                            .update(cx, |repository, _| repository.change_branch(branch_name))
+                            .await??;
+
+                        anyhow::Ok(())
+                    })
+                    .detach_and_prompt_err("Failed to change branch", window, cx, |_, _, _| None);
+            }
+            PullRequestContextMenuEffect::OpenChanges => {
+                let Some(pull_request) = selected_pull_request else {
+                    return;
+                };
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                let Some(repository) = resolve_active_repository(&workspace.read(cx), cx) else {
+                    return;
+                };
+
+                window
+                    .spawn(cx, async move |cx| {
+                        let branches = repository
+                            .update(cx, |repository, _| repository.branches())
+                            .await??;
+                        let head_branch_name =
+                            branch_name_for_pull_request_head(&pull_request.head_ref, &branches);
+                        let base_branch_name =
+                            branch_name_for_pull_request_base(&pull_request.base_ref, &branches);
+
+                        repository
+                            .update(cx, |repository, _| {
+                                repository.change_branch(head_branch_name)
+                            })
+                            .await??;
+
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            ProjectDiff::deploy_branch_diff_at(
+                                workspace,
+                                base_branch_name.into(),
+                                window,
+                                cx,
+                            );
+                        })?;
+
+                        anyhow::Ok(())
+                    })
+                    .detach_and_prompt_err(
+                        "Failed to open pull request changes",
+                        window,
+                        cx,
+                        |_, _, _| None,
+                    );
+            }
+            PullRequestContextMenuEffect::RefreshPullRequest => {
+                self.reload(cx);
+            }
+        }
+    }
+
+    fn set_context_menu(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
+                }) {
+                    cx.focus_self(window);
+                }
+
+                this.clear_context_menu();
+                cx.notify();
+            },
+        );
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn checkout_branch_action_disabled(
+        &self,
+        pull_request: &PullRequestSummary,
+        cx: &App,
+    ) -> bool {
+        let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let Some(repository) = resolve_active_repository(&workspace.read(cx), cx) else {
+            return false;
+        };
+        let repository = repository.read(cx);
+
+        current_branch_matches_pull_request_head(
+            &pull_request.head_ref,
+            repository.branch.as_ref(),
+            &data.branches,
+        )
+    }
+
+    fn clear_context_menu(&mut self) {
+        self.context_menu_pull_request.take();
+        self.context_menu.take();
+    }
 }
 
 fn has_hidden_pull_requests(
@@ -355,6 +540,91 @@ fn has_hidden_pull_requests(
     total_pull_request_count: usize,
 ) -> bool {
     visible_pull_request_count < total_pull_request_count
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PullRequestContextMenuEffect {
+    OpenInGitHub(String),
+    CheckoutBranch(String),
+    OpenChanges,
+    RefreshPullRequest,
+}
+
+fn pull_request_context_menu_effect(
+    action: pull_request_context_panel::PullRequestContextMenuAction,
+    selected_pull_request: Option<&PullRequestSummary>,
+) -> Option<PullRequestContextMenuEffect> {
+    match action {
+        pull_request_context_panel::PullRequestContextMenuAction::OpenInGitHub => {
+            selected_pull_request.map(|pull_request| {
+                PullRequestContextMenuEffect::OpenInGitHub(pull_request.html_url.clone())
+            })
+        }
+        pull_request_context_panel::PullRequestContextMenuAction::CheckoutBranch => {
+            selected_pull_request.map(|pull_request| {
+                PullRequestContextMenuEffect::CheckoutBranch(pull_request.head_ref.clone())
+            })
+        }
+        pull_request_context_panel::PullRequestContextMenuAction::OpenChanges => {
+            Some(PullRequestContextMenuEffect::OpenChanges)
+        }
+        pull_request_context_panel::PullRequestContextMenuAction::RefreshPullRequest => {
+            Some(PullRequestContextMenuEffect::RefreshPullRequest)
+        }
+    }
+}
+
+fn branch_name_for_pull_request_head(head_ref: &str, branches: &[Branch]) -> String {
+    branch_name_for_pull_request_ref(head_ref, branches)
+}
+
+fn branch_name_for_pull_request_base(base_ref: &str, branches: &[Branch]) -> String {
+    branch_name_for_pull_request_ref(base_ref, branches)
+}
+
+fn current_branch_matches_pull_request_head(
+    head_ref: &str,
+    current_branch: Option<&Branch>,
+    branches: &[Branch],
+) -> bool {
+    let Some(current_branch) = current_branch else {
+        return false;
+    };
+
+    current_branch.name() == branch_name_for_pull_request_head(head_ref, branches)
+}
+
+fn branch_name_for_pull_request_ref(reference: &str, branches: &[Branch]) -> String {
+    if branches
+        .iter()
+        .any(|branch| !branch.is_remote() && branch.name() == reference)
+    {
+        return reference.to_string();
+    }
+
+    for preferred_remote in ["upstream", "origin"] {
+        let preferred_branch = format!("{preferred_remote}/{reference}");
+        if branches
+            .iter()
+            .any(|branch| branch.is_remote() && branch.name() == preferred_branch)
+        {
+            return preferred_branch;
+        }
+    }
+
+    if let Some(remote_branch_name) = branches.iter().find_map(|branch| {
+        branch.is_remote().then_some(branch).and_then(|branch| {
+            branch
+                .name()
+                .split_once('/')
+                .filter(|(_, branch_name)| *branch_name == reference)
+                .map(|_| branch.name().to_string())
+        })
+    }) {
+        return remote_branch_name;
+    }
+
+    reference.to_string()
 }
 
 impl EventEmitter<PanelEvent> for PullRequestPanel {}
@@ -374,6 +644,15 @@ impl Render for PullRequestPanel {
             .overflow_hidden()
             .child(top_bar::render_top_bar(self, window, cx))
             .child(list::render_content(self, window, cx))
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Corner::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
@@ -441,6 +720,9 @@ impl Panel for PullRequestPanel {
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.active = active;
+        if !active {
+            self.clear_context_menu();
+        }
         cx.notify();
     }
 
@@ -501,6 +783,7 @@ enum PullRequestPanelContent {
 struct PullRequestPanelData {
     repository: GitHubRepositoryContext,
     sections: CategorizedPullRequests,
+    branches: Vec<Branch>,
 }
 
 impl PullRequestPanelData {
@@ -595,6 +878,7 @@ struct PullRequestSummary {
     html_url: String,
     author_login: String,
     head_ref: String,
+    base_ref: String,
     requested_reviewer_logins: Vec<String>,
     updated_at: DateTime<Utc>,
 }
@@ -607,6 +891,7 @@ struct GitHubPullRequestResponse {
     updated_at: DateTime<Utc>,
     user: GitHubUserResponse,
     head: GitHubPullRequestHeadResponse,
+    base: GitHubPullRequestBaseResponse,
     #[serde(default)]
     requested_reviewers: Vec<GitHubUserResponse>,
 }
@@ -618,6 +903,12 @@ struct GitHubUserResponse {
 
 #[derive(Debug, serde::Deserialize)]
 struct GitHubPullRequestHeadResponse {
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubPullRequestBaseResponse {
     #[serde(rename = "ref")]
     reference: String,
 }
@@ -735,7 +1026,7 @@ async fn load_pull_request_panel_data(
         .update(cx, |repository: &mut Repository, _| repository.branches())
         .await??;
     let local_branch_names = branches
-        .into_iter()
+        .iter()
         .filter(|branch| !branch.is_remote())
         .map(|branch| branch.name().to_string())
         .collect::<HashSet<_>>();
@@ -750,6 +1041,7 @@ async fn load_pull_request_panel_data(
             load_context.current_user_login.as_deref(),
             &local_branch_names,
         ),
+        branches,
     })
 }
 
@@ -889,6 +1181,7 @@ impl From<GitHubPullRequestResponse> for PullRequestSummary {
             html_url: value.html_url,
             author_login: value.user.login,
             head_ref: value.head.reference,
+            base_ref: value.base.reference,
             requested_reviewer_logins: value
                 .requested_reviewers
                 .into_iter()
@@ -903,6 +1196,15 @@ impl From<GitHubPullRequestResponse> for PullRequestSummary {
 mod tests {
     use super::*;
 
+    fn branch(ref_name: &str) -> Branch {
+        Branch {
+            is_head: false,
+            ref_name: ref_name.to_string().into(),
+            upstream: None,
+            most_recent_commit: None,
+        }
+    }
+
     fn pull_request(
         number: u64,
         author_login: &str,
@@ -916,6 +1218,7 @@ mod tests {
             html_url: format!("https://example.com/pull/{number}"),
             author_login: author_login.to_string(),
             head_ref: head_ref.to_string(),
+            base_ref: "main".to_string(),
             requested_reviewer_logins: requested_reviewer_logins
                 .iter()
                 .map(|login| (*login).to_string())
@@ -1176,5 +1479,196 @@ mod tests {
         assert!(has_hidden_pull_requests(20, 21));
         assert!(!has_hidden_pull_requests(20, 20));
         assert!(!has_hidden_pull_requests(21, 20));
+    }
+
+    #[test]
+    fn branch_name_for_pull_request_head_prefers_local_then_preferred_remotes() {
+        assert_eq!(
+            branch_name_for_pull_request_head(
+                "feature/topic",
+                &[
+                    branch("refs/remotes/origin/feature/topic"),
+                    branch("refs/heads/feature/topic"),
+                    branch("refs/remotes/upstream/feature/topic"),
+                ]
+            ),
+            "feature/topic"
+        );
+
+        assert_eq!(
+            branch_name_for_pull_request_head(
+                "feature/topic",
+                &[
+                    branch("refs/remotes/origin/feature/topic"),
+                    branch("refs/remotes/upstream/feature/topic"),
+                ]
+            ),
+            "upstream/feature/topic"
+        );
+    }
+
+    #[test]
+    fn branch_name_for_pull_request_head_falls_back_to_any_matching_remote_or_head_ref() {
+        assert_eq!(
+            branch_name_for_pull_request_head(
+                "feature/topic",
+                &[branch("refs/remotes/fork/feature/topic")]
+            ),
+            "fork/feature/topic"
+        );
+
+        assert_eq!(
+            branch_name_for_pull_request_head("missing-branch", &[]),
+            "missing-branch"
+        );
+    }
+
+    #[test]
+    fn branch_name_for_pull_request_base_prefers_local_then_preferred_remotes() {
+        assert_eq!(
+            branch_name_for_pull_request_base(
+                "main",
+                &[
+                    branch("refs/remotes/origin/main"),
+                    branch("refs/heads/main"),
+                    branch("refs/remotes/upstream/main"),
+                ]
+            ),
+            "main"
+        );
+
+        assert_eq!(
+            branch_name_for_pull_request_base(
+                "main",
+                &[
+                    branch("refs/remotes/origin/main"),
+                    branch("refs/remotes/upstream/main"),
+                ]
+            ),
+            "upstream/main"
+        );
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_when_current_branch_already_matches() {
+        assert!(current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/heads/feature/topic")),
+            &[branch("refs/heads/feature/topic")]
+        ));
+
+        assert!(current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/remotes/upstream/feature/topic")),
+            &[branch("refs/remotes/upstream/feature/topic")]
+        ));
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different(
+    ) {
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/heads/main")),
+            &[branch("refs/heads/main")]
+        ));
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            None,
+            &[branch("refs/heads/feature/topic")]
+        ));
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_uses_full_branch_list_for_resolution() {
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/remotes/origin/feature/topic")),
+            &[
+                branch("refs/remotes/origin/feature/topic"),
+                branch("refs/heads/feature/topic"),
+            ]
+        ));
+    }
+
+    #[test]
+    fn github_pull_request_response_conversion_includes_base_ref() {
+        let summary = PullRequestSummary::from(GitHubPullRequestResponse {
+            number: 42,
+            title: "PR 42".to_string(),
+            html_url: "https://example.com/pull/42".to_string(),
+            updated_at: "2026-03-10T12:00:00Z".parse().unwrap(),
+            user: GitHubUserResponse {
+                login: "author".to_string(),
+            },
+            head: GitHubPullRequestHeadResponse {
+                reference: "feature/topic".to_string(),
+            },
+            base: GitHubPullRequestBaseResponse {
+                reference: "main".to_string(),
+            },
+            requested_reviewers: vec![GitHubUserResponse {
+                login: "reviewer".to_string(),
+            }],
+        });
+
+        assert_eq!(summary.head_ref, "feature/topic");
+        assert_eq!(summary.base_ref, "main");
+    }
+
+    #[test]
+    fn pull_request_context_menu_effect_uses_selected_pull_request_fields() {
+        let pull_request = pull_request(42, "author", "feature/topic", &[], "2026-03-10T12:00:00Z");
+
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::OpenInGitHub,
+                Some(&pull_request),
+            ),
+            Some(PullRequestContextMenuEffect::OpenInGitHub(
+                pull_request.html_url.clone(),
+            ))
+        );
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::CheckoutBranch,
+                Some(&pull_request),
+            ),
+            Some(PullRequestContextMenuEffect::CheckoutBranch(
+                pull_request.head_ref.clone(),
+            ))
+        );
+    }
+
+    #[test]
+    fn pull_request_context_menu_effect_preserves_non_pull_request_actions_without_selection() {
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::OpenInGitHub,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::CheckoutBranch,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::OpenChanges,
+                None,
+            ),
+            Some(PullRequestContextMenuEffect::OpenChanges)
+        );
+        assert_eq!(
+            pull_request_context_menu_effect(
+                pull_request_context_panel::PullRequestContextMenuAction::RefreshPullRequest,
+                None,
+            ),
+            Some(PullRequestContextMenuEffect::RefreshPullRequest)
+        );
     }
 }

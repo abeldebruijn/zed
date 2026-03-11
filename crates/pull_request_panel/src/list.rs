@@ -1,5 +1,4 @@
-use chrono::{DateTime, Utc};
-use gpui::{AnyElement, Context, StatefulInteractiveElement, Window};
+use gpui::{AnyElement, Context, MouseDownEvent, StatefulInteractiveElement, Window};
 use ui::{
     Button, ButtonCommon, ButtonStyle, Color, Label, LabelSize, ListHeader, ListItem, prelude::*,
     v_flex,
@@ -198,7 +197,7 @@ fn render_section(
             } else {
                 pull_requests
                     .iter()
-                    .map(|pull_request| render_pull_request_row(section, pull_request))
+                    .map(|pull_request| render_pull_request_row(section, pull_request, cx))
                     .collect()
             })
         })
@@ -237,20 +236,39 @@ fn render_empty_row(section: PullRequestSection) -> AnyElement {
 fn render_pull_request_row(
     section: PullRequestSection,
     pull_request: &PullRequestSummary,
+    cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
+    let context_menu_pull_request = pull_request.clone();
+
     ListItem::new(format!("{}-pr-{}", section.id(), pull_request.number))
         .inset(true)
         .indent_level(1)
+        .on_secondary_mouse_down(
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.deploy_pull_request_context_menu(
+                    context_menu_pull_request.clone(),
+                    event.position,
+                    window,
+                    cx,
+                );
+            }),
+        )
+        .child(render_pull_request_row_body(pull_request))
+        .into_any_element()
+}
+
+fn render_pull_request_row_body(pull_request: &PullRequestSummary) -> AnyElement {
+    v_flex()
+        .debug_selector(|| "pull-request-row-body".into())
+        .w_full()
+        .overflow_hidden()
         .child(
             Label::new(format!("#{} {}", pull_request.number, pull_request.title))
                 .size(LabelSize::Small)
                 .truncate(),
         )
         .into_any_element()
-}
-
-fn format_updated_at(updated_at: &DateTime<Utc>) -> String {
-    updated_at.format("%Y-%m-%d").to_string()
 }
 
 fn section_count_label(count: usize) -> Label {
@@ -263,7 +281,7 @@ fn section_count_label(count: usize) -> Label {
 mod tests {
     use super::{
         PullRequestSection, PullRequestSummary, ReadyStateListItem, ready_state_list_items,
-        render_pull_request_row,
+        render_pull_request_row_body,
     };
     use gpui::{Context, Render, TestAppContext, Window, div, point, px, size};
     use settings::SettingsStore;
@@ -278,10 +296,7 @@ mod tests {
             div()
                 .w(px(240.))
                 .debug_selector(|| "pull-request-row-wrapper".into())
-                .child(render_pull_request_row(
-                    PullRequestSection::AllOpen,
-                    &self.pull_request,
-                ))
+                .child(render_pull_request_row_body(&self.pull_request))
         }
     }
 
@@ -350,6 +365,7 @@ mod tests {
             html_url: "https://example.com/pull/42".to_string(),
             author_login: "abeldebruijn".to_string(),
             head_ref: "very-long-branch-name-for-layout-regression-coverage".to_string(),
+            base_ref: "main".to_string(),
             requested_reviewer_logins: Vec::new(),
             updated_at: "2026-03-10T12:00:00Z"
                 .parse()
@@ -370,7 +386,7 @@ mod tests {
             .expect("row body should be rendered");
 
         assert!(
-            row_body_bounds.size.width <= wrapper_bounds.size.width - px(16.),
+            row_body_bounds.size.width <= wrapper_bounds.size.width,
             "row body should stay bounded within the constrained row width: {row_body_bounds:?} vs {wrapper_bounds:?}"
         );
         assert!(
