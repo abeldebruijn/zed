@@ -365,10 +365,12 @@ impl PullRequestPanel {
         cx: &mut Context<Self>,
     ) {
         let panel = cx.entity().downgrade();
+        let checkout_branch_disabled = self.checkout_branch_action_disabled(&pull_request, cx);
         let context_menu = pull_request_context_panel::build_context_menu(
             window,
             cx,
             self.focus_handle.clone(),
+            checkout_branch_disabled,
             move |action, window, cx| {
                 let Some(panel) = panel.upgrade() else {
                     return;
@@ -504,6 +506,29 @@ impl PullRequestPanel {
         cx.notify();
     }
 
+    fn checkout_branch_action_disabled(
+        &self,
+        pull_request: &PullRequestSummary,
+        cx: &App,
+    ) -> bool {
+        let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let Some(repository) = resolve_active_repository(&workspace.read(cx), cx) else {
+            return false;
+        };
+        let repository = repository.read(cx);
+
+        current_branch_matches_pull_request_head(
+            &pull_request.head_ref,
+            repository.branch.as_ref(),
+            &data.branches,
+        )
+    }
+
     fn clear_context_menu(&mut self) {
         self.context_menu_pull_request.take();
         self.context_menu.take();
@@ -555,6 +580,18 @@ fn branch_name_for_pull_request_head(head_ref: &str, branches: &[Branch]) -> Str
 
 fn branch_name_for_pull_request_base(base_ref: &str, branches: &[Branch]) -> String {
     branch_name_for_pull_request_ref(base_ref, branches)
+}
+
+fn current_branch_matches_pull_request_head(
+    head_ref: &str,
+    current_branch: Option<&Branch>,
+    branches: &[Branch],
+) -> bool {
+    let Some(current_branch) = current_branch else {
+        return false;
+    };
+
+    current_branch.name() == branch_name_for_pull_request_head(head_ref, branches)
 }
 
 fn branch_name_for_pull_request_ref(reference: &str, branches: &[Branch]) -> String {
@@ -746,6 +783,7 @@ enum PullRequestPanelContent {
 struct PullRequestPanelData {
     repository: GitHubRepositoryContext,
     sections: CategorizedPullRequests,
+    branches: Vec<Branch>,
 }
 
 impl PullRequestPanelData {
@@ -988,7 +1026,7 @@ async fn load_pull_request_panel_data(
         .update(cx, |repository: &mut Repository, _| repository.branches())
         .await??;
     let local_branch_names = branches
-        .into_iter()
+        .iter()
         .filter(|branch| !branch.is_remote())
         .map(|branch| branch.name().to_string())
         .collect::<HashSet<_>>();
@@ -1003,6 +1041,7 @@ async fn load_pull_request_panel_data(
             load_context.current_user_login.as_deref(),
             &local_branch_names,
         ),
+        branches,
     })
 }
 
@@ -1508,6 +1547,48 @@ mod tests {
             ),
             "upstream/main"
         );
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_when_current_branch_already_matches() {
+        assert!(current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/heads/feature/topic")),
+            &[branch("refs/heads/feature/topic")]
+        ));
+
+        assert!(current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/remotes/upstream/feature/topic")),
+            &[branch("refs/remotes/upstream/feature/topic")]
+        ));
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different(
+    ) {
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/heads/main")),
+            &[branch("refs/heads/main")]
+        ));
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            None,
+            &[branch("refs/heads/feature/topic")]
+        ));
+    }
+
+    #[test]
+    fn current_branch_matches_pull_request_head_uses_full_branch_list_for_resolution() {
+        assert!(!current_branch_matches_pull_request_head(
+            "feature/topic",
+            Some(&branch("refs/remotes/origin/feature/topic")),
+            &[
+                branch("refs/remotes/origin/feature/topic"),
+                branch("refs/heads/feature/topic"),
+            ]
+        ));
     }
 
     #[test]

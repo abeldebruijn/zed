@@ -38,12 +38,17 @@ impl PullRequestContextMenuAction {
             Self::RefreshPullRequest => IconName::RefreshTitle,
         }
     }
+
+    fn disabled(self, checkout_branch_disabled: bool) -> bool {
+        matches!(self, Self::CheckoutBranch) && checkout_branch_disabled
+    }
 }
 
 pub(super) fn build_context_menu(
     window: &mut Window,
     cx: &mut App,
     focus_handle: FocusHandle,
+    checkout_branch_disabled: bool,
     on_action: impl Fn(PullRequestContextMenuAction, &mut Window, &mut App) + 'static,
 ) -> Entity<ContextMenu> {
     let on_action = Rc::new(on_action);
@@ -56,6 +61,7 @@ pub(super) fn build_context_menu(
                 menu.item(
                     ContextMenuEntry::new(action.label())
                         .icon(action.icon())
+                        .disabled(action.disabled(checkout_branch_disabled))
                         .handler(move |window, cx| on_action(action, window, cx)),
                 )
             },
@@ -84,5 +90,14 @@ mod tests {
                 ("Refresh PR", IconName::RefreshTitle),
             ]
         );
+    }
+
+    #[test]
+    fn checkout_branch_is_the_only_conditionally_disabled_action() {
+        assert!(!PullRequestContextMenuAction::OpenInGitHub.disabled(true));
+        assert!(PullRequestContextMenuAction::CheckoutBranch.disabled(true));
+        assert!(!PullRequestContextMenuAction::OpenChanges.disabled(true));
+        assert!(!PullRequestContextMenuAction::RefreshPullRequest.disabled(true));
+        assert!(!PullRequestContextMenuAction::CheckoutBranch.disabled(false));
     }
 }
