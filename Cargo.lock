@@ -13488,6 +13488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "theme",
  "ui",
  "workspace",
  "zed_actions",
