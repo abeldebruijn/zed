@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use gpui::{App, Entity, FocusHandle, Window};
-use ui::ContextMenu;
+use ui::{ContextMenu, ContextMenuEntry, IconName};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PullRequestContextMenuAction {
@@ -29,6 +29,15 @@ impl PullRequestContextMenuAction {
             Self::RefreshPullRequest => "Refresh PR",
         }
     }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::OpenInGitHub => IconName::Github,
+            Self::CheckoutBranch => IconName::GitBranch,
+            Self::OpenChanges => IconName::Diff,
+            Self::RefreshPullRequest => IconName::RefreshTitle,
+        }
+    }
 }
 
 pub(super) fn build_context_menu(
@@ -40,35 +49,39 @@ pub(super) fn build_context_menu(
     let on_action = Rc::new(on_action);
 
     ContextMenu::build(window, cx, move |menu, _, _| {
-        PullRequestContextMenuAction::ordered()
-            .into_iter()
-            .fold(menu.context(focus_handle.clone()), |menu, action| {
+        PullRequestContextMenuAction::ordered().into_iter().fold(
+            menu.context(focus_handle.clone()),
+            |menu, action| {
                 let on_action = on_action.clone();
-                menu.entry(action.label(), None, move |window, cx| {
-                    on_action(action, window, cx);
-                })
-            })
+                menu.item(
+                    ContextMenuEntry::new(action.label())
+                        .icon(action.icon())
+                        .handler(move |window, cx| on_action(action, window, cx)),
+                )
+            },
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::PullRequestContextMenuAction;
+    use ui::IconName;
 
     #[test]
-    fn ordered_actions_match_requested_menu_order() {
-        let labels = PullRequestContextMenuAction::ordered()
+    fn ordered_actions_match_requested_menu_metadata() {
+        let entries = PullRequestContextMenuAction::ordered()
             .into_iter()
-            .map(|action| action.label())
+            .map(|action| (action.label(), action.icon()))
             .collect::<Vec<_>>();
 
         assert_eq!(
-            labels,
+            entries,
             vec![
-                "Open in GitHub",
-                "Checkout branch",
-                "Open changes",
-                "Refresh PR",
+                ("Open in GitHub", IconName::Github),
+                ("Checkout branch", IconName::GitBranch),
+                ("Open changes", IconName::Diff),
+                ("Refresh PR", IconName::RefreshTitle),
             ]
         );
     }

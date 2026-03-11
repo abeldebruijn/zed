@@ -1,13 +1,13 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures::AsyncReadExt;
-use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use git::repository::Branch;
+use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use git_ui::{project_diff::ProjectDiff, resolve_active_repository};
 use gpui::{
-    Action, App, AppContext, AsyncWindowContext, BorrowAppContext, Context, Corner,
-    DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels,
-    Point, Render, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
+    Action, App, AppContext, AsyncWindowContext, BorrowAppContext, Context, Corner, DismissEvent,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Point, Render,
+    Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request, StatusCode};
 use project::git_store::{GitStoreEvent, Repository, RepositoryEvent};
@@ -15,9 +15,9 @@ use settings::SettingsStore;
 use std::{collections::HashSet, sync::Arc};
 use ui::{ContextMenu, IconName, prelude::*, v_flex};
 use workspace::{
-    notifications::DetachAndPromptErr,
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::DetachAndPromptErr,
 };
 
 mod list;
@@ -390,7 +390,8 @@ impl PullRequestPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let effect = pull_request_context_menu_effect(action, self.context_menu_pull_request.as_ref());
+        let selected_pull_request = self.context_menu_pull_request.clone();
+        let effect = pull_request_context_menu_effect(action, selected_pull_request.as_ref());
         self.clear_context_menu();
         cx.focus_self(window);
         cx.notify();
@@ -411,28 +412,65 @@ impl PullRequestPanel {
                     return;
                 };
 
-                cx.spawn(async move |_, cx| {
-                    let branches = repository
-                        .update(cx, |repository, _| repository.branches())
-                        .await??;
-                    let branch_name = branch_name_for_pull_request_head(&head_ref, &branches);
+                window
+                    .spawn(cx, async move |cx| {
+                        let branches = repository
+                            .update(cx, |repository, _| repository.branches())
+                            .await??;
+                        let branch_name = branch_name_for_pull_request_head(&head_ref, &branches);
 
-                    repository
-                        .update(cx, |repository, _| repository.change_branch(branch_name))
-                        .await??;
+                        repository
+                            .update(cx, |repository, _| repository.change_branch(branch_name))
+                            .await??;
 
-                    anyhow::Ok(())
-                })
-                .detach_and_prompt_err("Failed to change branch", window, cx, |_, _, _| None);
+                        anyhow::Ok(())
+                    })
+                    .detach_and_prompt_err("Failed to change branch", window, cx, |_, _, _| None);
             }
             PullRequestContextMenuEffect::OpenChanges => {
+                let Some(pull_request) = selected_pull_request else {
+                    return;
+                };
                 let Some(workspace) = self.workspace.upgrade() else {
                     return;
                 };
+                let Some(repository) = resolve_active_repository(&workspace.read(cx), cx) else {
+                    return;
+                };
 
-                workspace.update(cx, |workspace, cx| {
-                    ProjectDiff::deploy_at(workspace, None, window, cx);
-                });
+                window
+                    .spawn(cx, async move |cx| {
+                        let branches = repository
+                            .update(cx, |repository, _| repository.branches())
+                            .await??;
+                        let head_branch_name =
+                            branch_name_for_pull_request_head(&pull_request.head_ref, &branches);
+                        let base_branch_name =
+                            branch_name_for_pull_request_base(&pull_request.base_ref, &branches);
+
+                        repository
+                            .update(cx, |repository, _| {
+                                repository.change_branch(head_branch_name)
+                            })
+                            .await??;
+
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            ProjectDiff::deploy_branch_diff_at(
+                                workspace,
+                                base_branch_name.into(),
+                                window,
+                                cx,
+                            );
+                        })?;
+
+                        anyhow::Ok(())
+                    })
+                    .detach_and_prompt_err(
+                        "Failed to open pull request changes",
+                        window,
+                        cx,
+                        |_, _, _| None,
+                    );
             }
             PullRequestContextMenuEffect::RefreshPullRequest => {
                 self.reload(cx);
@@ -512,15 +550,23 @@ fn pull_request_context_menu_effect(
 }
 
 fn branch_name_for_pull_request_head(head_ref: &str, branches: &[Branch]) -> String {
+    branch_name_for_pull_request_ref(head_ref, branches)
+}
+
+fn branch_name_for_pull_request_base(base_ref: &str, branches: &[Branch]) -> String {
+    branch_name_for_pull_request_ref(base_ref, branches)
+}
+
+fn branch_name_for_pull_request_ref(reference: &str, branches: &[Branch]) -> String {
     if branches
         .iter()
-        .any(|branch| !branch.is_remote() && branch.name() == head_ref)
+        .any(|branch| !branch.is_remote() && branch.name() == reference)
     {
-        return head_ref.to_string();
+        return reference.to_string();
     }
 
     for preferred_remote in ["upstream", "origin"] {
-        let preferred_branch = format!("{preferred_remote}/{head_ref}");
+        let preferred_branch = format!("{preferred_remote}/{reference}");
         if branches
             .iter()
             .any(|branch| branch.is_remote() && branch.name() == preferred_branch)
@@ -534,14 +580,14 @@ fn branch_name_for_pull_request_head(head_ref: &str, branches: &[Branch]) -> Str
             branch
                 .name()
                 .split_once('/')
-                .filter(|(_, branch_name)| *branch_name == head_ref)
+                .filter(|(_, branch_name)| *branch_name == reference)
                 .map(|_| branch.name().to_string())
         })
     }) {
         return remote_branch_name;
     }
 
-    head_ref.to_string()
+    reference.to_string()
 }
 
 impl EventEmitter<PanelEvent> for PullRequestPanel {}
@@ -794,6 +840,7 @@ struct PullRequestSummary {
     html_url: String,
     author_login: String,
     head_ref: String,
+    base_ref: String,
     requested_reviewer_logins: Vec<String>,
     updated_at: DateTime<Utc>,
 }
@@ -806,6 +853,7 @@ struct GitHubPullRequestResponse {
     updated_at: DateTime<Utc>,
     user: GitHubUserResponse,
     head: GitHubPullRequestHeadResponse,
+    base: GitHubPullRequestBaseResponse,
     #[serde(default)]
     requested_reviewers: Vec<GitHubUserResponse>,
 }
@@ -817,6 +865,12 @@ struct GitHubUserResponse {
 
 #[derive(Debug, serde::Deserialize)]
 struct GitHubPullRequestHeadResponse {
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubPullRequestBaseResponse {
     #[serde(rename = "ref")]
     reference: String,
 }
@@ -1088,6 +1142,7 @@ impl From<GitHubPullRequestResponse> for PullRequestSummary {
             html_url: value.html_url,
             author_login: value.user.login,
             head_ref: value.head.reference,
+            base_ref: value.base.reference,
             requested_reviewer_logins: value
                 .requested_reviewers
                 .into_iter()
@@ -1124,6 +1179,7 @@ mod tests {
             html_url: format!("https://example.com/pull/{number}"),
             author_login: author_login.to_string(),
             head_ref: head_ref.to_string(),
+            base_ref: "main".to_string(),
             requested_reviewer_logins: requested_reviewer_logins
                 .iter()
                 .map(|login| (*login).to_string())
@@ -1426,6 +1482,57 @@ mod tests {
             branch_name_for_pull_request_head("missing-branch", &[]),
             "missing-branch"
         );
+    }
+
+    #[test]
+    fn branch_name_for_pull_request_base_prefers_local_then_preferred_remotes() {
+        assert_eq!(
+            branch_name_for_pull_request_base(
+                "main",
+                &[
+                    branch("refs/remotes/origin/main"),
+                    branch("refs/heads/main"),
+                    branch("refs/remotes/upstream/main"),
+                ]
+            ),
+            "main"
+        );
+
+        assert_eq!(
+            branch_name_for_pull_request_base(
+                "main",
+                &[
+                    branch("refs/remotes/origin/main"),
+                    branch("refs/remotes/upstream/main"),
+                ]
+            ),
+            "upstream/main"
+        );
+    }
+
+    #[test]
+    fn github_pull_request_response_conversion_includes_base_ref() {
+        let summary = PullRequestSummary::from(GitHubPullRequestResponse {
+            number: 42,
+            title: "PR 42".to_string(),
+            html_url: "https://example.com/pull/42".to_string(),
+            updated_at: "2026-03-10T12:00:00Z".parse().unwrap(),
+            user: GitHubUserResponse {
+                login: "author".to_string(),
+            },
+            head: GitHubPullRequestHeadResponse {
+                reference: "feature/topic".to_string(),
+            },
+            base: GitHubPullRequestBaseResponse {
+                reference: "main".to_string(),
+            },
+            requested_reviewers: vec![GitHubUserResponse {
+                login: "reviewer".to_string(),
+            }],
+        });
+
+        assert_eq!(summary.head_ref, "feature/topic");
+        assert_eq!(summary.base_ref, "main");
     }
 
     #[test]

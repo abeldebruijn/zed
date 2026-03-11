@@ -243,15 +243,17 @@ fn render_pull_request_row(
     ListItem::new(format!("{}-pr-{}", section.id(), pull_request.number))
         .inset(true)
         .indent_level(1)
-        .on_secondary_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-            cx.stop_propagation();
-            this.deploy_pull_request_context_menu(
-                context_menu_pull_request.clone(),
-                event.position,
-                window,
-                cx,
-            );
-        }))
+        .on_secondary_mouse_down(
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.deploy_pull_request_context_menu(
+                    context_menu_pull_request.clone(),
+                    event.position,
+                    window,
+                    cx,
+                );
+            }),
+        )
         .child(render_pull_request_row_body(pull_request))
         .into_any_element()
 }
@@ -363,6 +365,7 @@ mod tests {
             html_url: "https://example.com/pull/42".to_string(),
             author_login: "abeldebruijn".to_string(),
             head_ref: "very-long-branch-name-for-layout-regression-coverage".to_string(),
+            base_ref: "main".to_string(),
             requested_reviewer_logins: Vec::new(),
             updated_at: "2026-03-10T12:00:00Z"
                 .parse()
