@@ -270,10 +270,12 @@ fn format_updated_at(updated_at: &DateTime<Utc>) -> String {
     updated_at.format("%Y-%m-%d").to_string()
 }
 
-fn section_count_label(count: usize) -> Label {
-    Label::new(count.to_string())
-        .size(LabelSize::Small)
-        .color(Color::Muted)
+fn section_count_label(count: usize) -> impl IntoElement {
+    div().min_w_8().flex().justify_end().child(
+        Label::new(count.to_string())
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+    )
 }
 
 #[cfg(test)]

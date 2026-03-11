@@ -29,6 +29,73 @@ const COPILOT_AUTHOR_LOGINS: &[&str] = &["copilot-swe-agent", "github-copilot[bo
 const INITIAL_VISIBLE_PULL_REQUEST_COUNT: usize = 20;
 const LOAD_MORE_PULL_REQUEST_COUNT: usize = 20;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PullRequestSort {
+    Created,
+    Updated,
+    Popularity,
+    LongRunning,
+}
+
+impl PullRequestSort {
+    fn ordered() -> [Self; 4] {
+        [
+            Self::Created,
+            Self::Updated,
+            Self::Popularity,
+            Self::LongRunning,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Popularity => "popularity",
+            Self::LongRunning => "long-running",
+        }
+    }
+
+    fn github_value(self) -> &'static str {
+        self.label()
+    }
+}
+
+impl Default for PullRequestSort {
+    fn default() -> Self {
+        Self::Created
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PullRequestSortDirection {
+    Asc,
+    Desc,
+}
+
+impl PullRequestSortDirection {
+    fn ordered() -> [Self; 2] {
+        [Self::Asc, Self::Desc]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    fn github_value(self) -> &'static str {
+        self.label()
+    }
+}
+
+impl Default for PullRequestSortDirection {
+    fn default() -> Self {
+        Self::Desc
+    }
+}
+
 actions!(
     pull_request_panel,
     [
@@ -65,12 +132,21 @@ pub struct PullRequestPanel {
     load_generation: usize,
     active_repository_id: Option<EntityId>,
     visible_pull_request_count: usize,
+    sort: PullRequestSort,
+    sort_direction: PullRequestSortDirection,
     view_state: PullRequestPanelViewState,
     collapsed_sections: HashSet<list::PullRequestSection>,
 }
 
 impl PullRequestPanel {
     fn default_collapsed_sections() -> HashSet<list::PullRequestSection> {
+        list::PullRequestSection::ordered()
+            .into_iter()
+            .filter(|section| *section != list::PullRequestSection::AllOpen)
+            .collect()
+    }
+
+    fn collapse_all_sections_set() -> HashSet<list::PullRequestSection> {
         list::PullRequestSection::ordered().into_iter().collect()
     }
 
@@ -123,6 +199,8 @@ impl PullRequestPanel {
                 load_generation: 0,
                 active_repository_id: None,
                 visible_pull_request_count: INITIAL_VISIBLE_PULL_REQUEST_COUNT,
+                sort: PullRequestSort::default(),
+                sort_direction: PullRequestSortDirection::default(),
                 view_state: PullRequestPanelViewState::loading(),
                 collapsed_sections: Self::default_collapsed_sections(),
             }
@@ -166,7 +244,7 @@ impl PullRequestPanel {
             return;
         };
 
-        match prepare_load_context(&workspace.read(cx), cx) {
+        match prepare_load_context(&workspace.read(cx), self.sort, self.sort_direction, cx) {
             PreparedLoadContext::Unavailable {
                 active_repository_id,
                 message,
@@ -218,8 +296,30 @@ impl PullRequestPanel {
     }
 
     fn collapse_all_sections(&mut self, cx: &mut Context<Self>) {
-        self.collapsed_sections = Self::default_collapsed_sections();
+        self.collapsed_sections = Self::collapse_all_sections_set();
         cx.notify();
+    }
+
+    fn set_sort(&mut self, sort: PullRequestSort, cx: &mut Context<Self>) {
+        if self.sort == sort {
+            return;
+        }
+
+        self.sort = sort;
+        self.reload(cx);
+    }
+
+    fn set_sort_direction(
+        &mut self,
+        sort_direction: PullRequestSortDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sort_direction == sort_direction {
+            return;
+        }
+
+        self.sort_direction = sort_direction;
+        self.reload(cx);
     }
 
     fn can_collapse_all_sections(&self) -> bool {
@@ -426,6 +526,8 @@ struct PullRequestLoadContext {
     repository: Entity<Repository>,
     github_repository: GitHubRepositoryContext,
     current_user_login: Option<String>,
+    sort: PullRequestSort,
+    sort_direction: PullRequestSortDirection,
 }
 
 enum PreparedLoadContext {
@@ -524,7 +626,12 @@ fn active_repository_id_for_workspace(workspace: &Workspace, cx: &App) -> Option
     resolve_active_repository(workspace, cx).map(|repository| repository.entity_id())
 }
 
-fn prepare_load_context(workspace: &Workspace, cx: &App) -> PreparedLoadContext {
+fn prepare_load_context(
+    workspace: &Workspace,
+    sort: PullRequestSort,
+    sort_direction: PullRequestSortDirection,
+    cx: &App,
+) -> PreparedLoadContext {
     let Some(repository) = resolve_active_repository(workspace, cx) else {
         return PreparedLoadContext::Unavailable {
             active_repository_id: None,
@@ -594,6 +701,8 @@ fn prepare_load_context(workspace: &Workspace, cx: &App) -> PreparedLoadContext 
             .read(cx)
             .current_user()
             .map(|user| user.github_login.to_string()),
+        sort,
+        sort_direction,
     })
 }
 
@@ -614,7 +723,13 @@ async fn load_pull_request_panel_data(
     cx: &mut gpui::AsyncApp,
 ) -> Result<PullRequestPanelData> {
     let http_client = cx.update(|cx| cx.http_client());
-    let pull_requests = fetch_pull_requests(&load_context.github_repository, http_client).await?;
+    let pull_requests = fetch_pull_requests(
+        &load_context.github_repository,
+        load_context.sort,
+        load_context.sort_direction,
+        http_client,
+    )
+    .await?;
     let branches: Vec<git::repository::Branch> = load_context
         .repository
         .update(cx, |repository: &mut Repository, _| repository.branches())
@@ -640,13 +755,16 @@ async fn load_pull_request_panel_data(
 
 async fn fetch_pull_requests(
     repository: &GitHubRepositoryContext,
+    sort: PullRequestSort,
+    sort_direction: PullRequestSortDirection,
     http_client: Arc<dyn HttpClient>,
 ) -> Result<Vec<GitHubPullRequestResponse>> {
     let mut page = 1;
     let mut pull_requests = Vec::new();
 
     loop {
-        let request = github_pull_request_request(repository, &http_client, page)?;
+        let request =
+            github_pull_request_request(repository, sort, sort_direction, &http_client, page)?;
         let mut response = http_client.send(request).await?;
         let status = response.status();
         let has_next_page = response_has_next_page(&response)?;
@@ -673,14 +791,20 @@ async fn fetch_pull_requests(
 
 fn github_pull_request_request(
     repository: &GitHubRepositoryContext,
+    sort: PullRequestSort,
+    sort_direction: PullRequestSortDirection,
     http_client: &Arc<dyn HttpClient>,
     page: usize,
 ) -> Result<Request<AsyncBody>> {
     Request::builder()
         .method("GET")
         .uri(format!(
-            "{}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100&page={page}",
-            repository.api_base_url, repository.owner, repository.repo,
+            "{}/repos/{}/{}/pulls?state=open&sort={}&direction={}&per_page=100&page={page}",
+            repository.api_base_url,
+            repository.owner,
+            repository.repo,
+            sort.github_value(),
+            sort_direction.github_value(),
         ))
         .header("Accept", GITHUB_ACCEPT_HEADER)
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
@@ -743,16 +867,7 @@ fn categorize_pull_requests(
         }
     }
 
-    sort_pull_request_summaries(&mut sections.copilot_on_my_behalf);
-    sort_pull_request_summaries(&mut sections.local_pull_request_branches);
-    sort_pull_request_summaries(&mut sections.waiting_for_my_review);
-    sort_pull_request_summaries(&mut sections.created_by_me);
-    sort_pull_request_summaries(&mut sections.all_open);
     sections
-}
-
-fn sort_pull_request_summaries(pull_requests: &mut [PullRequestSummary]) {
-    pull_requests.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 }
 
 fn limit_pull_request_summaries(
@@ -810,21 +925,69 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_sort_defaults_and_options_match_spec() {
+        assert_eq!(PullRequestSort::default(), PullRequestSort::Created);
+        assert_eq!(
+            PullRequestSortDirection::default(),
+            PullRequestSortDirection::Desc
+        );
+        assert_eq!(
+            PullRequestSort::ordered()
+                .into_iter()
+                .map(PullRequestSort::label)
+                .collect::<Vec<_>>(),
+            vec!["created", "updated", "popularity", "long-running"]
+        );
+        assert_eq!(
+            PullRequestSortDirection::ordered()
+                .into_iter()
+                .map(PullRequestSortDirection::label)
+                .collect::<Vec<_>>(),
+            vec!["asc", "desc"]
+        );
+    }
+
+    #[test]
+    fn github_pull_request_request_uses_selected_sort_and_direction() {
+        let repository = GitHubRepositoryContext {
+            owner: "zed-industries".to_string(),
+            repo: "zed".to_string(),
+            full_name: "zed-industries/zed".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+        };
+        let http_client: Arc<dyn HttpClient> = Arc::new(http_client::BlockedHttpClient::new());
+
+        let request = github_pull_request_request(
+            &repository,
+            PullRequestSort::Popularity,
+            PullRequestSortDirection::Asc,
+            &http_client,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/repos/zed-industries/zed/pulls?state=open&sort=popularity&direction=asc&per_page=100&page=3"
+        );
+    }
+
+    #[test]
     fn categorize_pull_requests_populates_expected_sections() {
         let pull_requests = vec![
-            pull_request(
-                1,
-                "copilot-swe-agent",
-                "local-feature",
-                &["abeldebruijn"],
-                "2026-03-09T12:00:00Z",
-            ),
             pull_request(
                 2,
                 "abeldebruijn",
                 "user-branch",
                 &[],
                 "2026-03-10T12:00:00Z",
+            ),
+            pull_request(
+                1,
+                "copilot-swe-agent",
+                "local-feature",
+                &["abeldebruijn"],
+                "2026-03-09T12:00:00Z",
             ),
             pull_request(
                 3,
@@ -919,18 +1082,18 @@ mod tests {
     fn categorized_pull_requests_limit_preserves_section_order_for_visible_prs() {
         let pull_requests = vec![
             pull_request(
-                1,
-                "copilot-swe-agent",
-                "local-feature",
-                &["abeldebruijn"],
-                "2026-03-09T12:00:00Z",
-            ),
-            pull_request(
                 2,
                 "abeldebruijn",
                 "user-branch",
                 &[],
                 "2026-03-10T12:00:00Z",
+            ),
+            pull_request(
+                1,
+                "copilot-swe-agent",
+                "local-feature",
+                &["abeldebruijn"],
+                "2026-03-09T12:00:00Z",
             ),
             pull_request(
                 3,
@@ -990,9 +1153,20 @@ mod tests {
     }
 
     #[test]
-    fn default_collapsed_sections_include_every_pull_request_section() {
+    fn default_collapsed_sections_leave_all_open_expanded() {
         assert_eq!(
             PullRequestPanel::default_collapsed_sections(),
+            list::PullRequestSection::ordered()
+                .into_iter()
+                .filter(|section| *section != list::PullRequestSection::AllOpen)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn collapse_all_sections_set_include_every_pull_request_section() {
+        assert_eq!(
+            PullRequestPanel::collapse_all_sections_set(),
             list::PullRequestSection::ordered().into_iter().collect()
         );
     }
