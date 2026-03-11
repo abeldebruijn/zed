@@ -242,26 +242,9 @@ fn render_pull_request_row(
         .inset(true)
         .indent_level(1)
         .child(
-            v_flex()
-                .w_full()
-                .overflow_hidden()
-                .gap_1()
-                .child(
-                    Label::new(format!("#{} {}", pull_request.number, pull_request.title))
-                        .size(LabelSize::Small)
-                        .truncate(),
-                )
-                .child(
-                    Label::new(format!(
-                        "{} · {} · updated {}",
-                        pull_request.author_login,
-                        pull_request.head_ref,
-                        format_updated_at(&pull_request.updated_at)
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate(),
-                ),
+            Label::new(format!("#{} {}", pull_request.number, pull_request.title))
+                .size(LabelSize::Small)
+                .truncate(),
         )
         .into_any_element()
 }
@@ -270,17 +253,37 @@ fn format_updated_at(updated_at: &DateTime<Utc>) -> String {
     updated_at.format("%Y-%m-%d").to_string()
 }
 
-fn section_count_label(count: usize) -> impl IntoElement {
-    div().min_w_8().flex().justify_end().child(
-        Label::new(count.to_string())
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-    )
+fn section_count_label(count: usize) -> Label {
+    Label::new(count.to_string())
+        .size(LabelSize::Small)
+        .color(Color::Muted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PullRequestSection, ReadyStateListItem, ready_state_list_items};
+    use super::{
+        PullRequestSection, PullRequestSummary, ReadyStateListItem, ready_state_list_items,
+        render_pull_request_row,
+    };
+    use gpui::{Context, Render, TestAppContext, Window, div, point, px, size};
+    use settings::SettingsStore;
+    use ui::prelude::*;
+
+    struct PullRequestRowTestView {
+        pull_request: PullRequestSummary,
+    }
+
+    impl Render for PullRequestRowTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(240.))
+                .debug_selector(|| "pull-request-row-wrapper".into())
+                .child(render_pull_request_row(
+                    PullRequestSection::AllOpen,
+                    &self.pull_request,
+                ))
+        }
+    }
 
     #[test]
     fn ordered_sections_match_requested_screenshot_order() {
@@ -330,6 +333,49 @@ mod tests {
                 .into_iter()
                 .map(ReadyStateListItem::Section)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[gpui::test]
+    fn pull_request_row_body_stays_within_available_width_for_long_text(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        let pull_request = PullRequestSummary {
+            number: 42,
+            title: "Make the pull request row keep enough width to truncate long content safely"
+                .to_string(),
+            html_url: "https://example.com/pull/42".to_string(),
+            author_login: "abeldebruijn".to_string(),
+            head_ref: "very-long-branch-name-for-layout-regression-coverage".to_string(),
+            requested_reviewer_logins: Vec::new(),
+            updated_at: "2026-03-10T12:00:00Z"
+                .parse()
+                .expect("valid RFC3339 timestamp"),
+        };
+        let (view, cx) = cx.add_window_view(|_, _| PullRequestRowTestView { pull_request });
+
+        cx.simulate_resize(size(px(240.), px(80.)));
+        cx.draw(point(px(0.), px(0.)), size(px(240.), px(80.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let wrapper_bounds = cx
+            .debug_bounds("pull-request-row-wrapper")
+            .expect("wrapper should be rendered");
+        let row_body_bounds = cx
+            .debug_bounds("pull-request-row-body")
+            .expect("row body should be rendered");
+
+        assert!(
+            row_body_bounds.size.width <= wrapper_bounds.size.width - px(16.),
+            "row body should stay bounded within the constrained row width: {row_body_bounds:?} vs {wrapper_bounds:?}"
+        );
+        assert!(
+            row_body_bounds.size.width > px(200.),
+            "row body should keep substantial width for truncation-safe labels: {row_body_bounds:?}"
         );
     }
 }
