@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use gpui::{AnyElement, Context, StatefulInteractiveElement, Window};
+use gpui::{AnyElement, Context, MouseDownEvent, StatefulInteractiveElement, Window};
 use ui::{
     Button, ButtonCommon, ButtonStyle, Color, Label, LabelSize, ListHeader, ListItem, prelude::*,
     v_flex,
@@ -198,7 +198,7 @@ fn render_section(
             } else {
                 pull_requests
                     .iter()
-                    .map(|pull_request| render_pull_request_row(section, pull_request))
+                    .map(|pull_request| render_pull_request_row(section, pull_request, cx))
                     .collect()
             })
         })
@@ -237,10 +237,22 @@ fn render_empty_row(section: PullRequestSection) -> AnyElement {
 fn render_pull_request_row(
     section: PullRequestSection,
     pull_request: &PullRequestSummary,
+    cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
+    let context_menu_pull_request = pull_request.clone();
+
     ListItem::new(format!("{}-pr-{}", section.id(), pull_request.number))
         .inset(true)
         .indent_level(1)
+        .on_secondary_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            this.deploy_pull_request_context_menu(
+                context_menu_pull_request.clone(),
+                event.position,
+                window,
+                cx,
+            );
+        }))
         .child(
             v_flex()
                 .w_full()
