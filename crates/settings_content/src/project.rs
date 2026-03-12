@@ -518,6 +518,12 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+
+    /// GitHub token used for GitHub REST API operations initiated by Zed (for example, creating
+    /// pull requests from the Pull Request panel).
+    ///
+    /// This value is stored in plaintext in your settings. Treat it like any other token.
+    pub github_token: Option<String>,
 }
 
 #[with_fallible_options]
