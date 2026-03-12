@@ -11,7 +11,7 @@ pub(super) fn render_top_bar(
     _window: &mut Window,
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
-    let focus_handle = panel.focus_handle.clone();
+    let _focus_handle = panel.focus_handle.clone();
     let panel_handle = cx.entity().downgrade();
     let refresh_disabled = !panel.view_state.refresh_ready;
     let collapse_all_disabled = !panel.can_collapse_all_sections();
@@ -40,20 +40,11 @@ pub(super) fn render_top_bar(
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::Small)
                         .style(ButtonStyle::Subtle)
-                        .on_click(|_, window, cx| {
-                            window
-                                .dispatch_action(Box::new(zed_actions::git::CreatePullRequest), cx)
-                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_create_pull_request_panel(window, cx);
+                        }))
                         .tooltip({
-                            let focus_handle = focus_handle.clone();
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Create pull request",
-                                    &zed_actions::git::CreatePullRequest,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            }
+                            move |_window, cx| Tooltip::simple("Create pull request", cx)
                         }),
                 )
                 .child(

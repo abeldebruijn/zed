@@ -10,8 +10,9 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request, StatusCode};
+use language::Buffer;
 use project::git_store::{GitStoreEvent, Repository, RepositoryEvent};
-use settings::SettingsStore;
+use settings::{RegisterSetting, Settings, SettingsStore};
 use std::{collections::HashSet, sync::Arc};
 use ui::{ContextMenu, IconName, prelude::*, v_flex};
 use workspace::{
@@ -20,6 +21,7 @@ use workspace::{
     notifications::DetachAndPromptErr,
 };
 
+mod create_pull_request_panel;
 mod list;
 mod pull_request_details_view;
 mod pull_request_context_panel;
@@ -142,6 +144,9 @@ pub struct PullRequestPanel {
     sort_direction: PullRequestSortDirection,
     view_state: PullRequestPanelViewState,
     collapsed_sections: HashSet<list::PullRequestSection>,
+
+    show_create_panel: bool,
+    create_pull_request: create_pull_request_panel::CreatePullRequestState,
 }
 
 impl PullRequestPanel {
@@ -169,7 +174,12 @@ impl PullRequestPanel {
         let user_store = workspace.user_store();
 
         let panel = cx.new(|cx| {
+            let create_title_buffer = cx.new(|cx| Buffer::local("", cx));
+            let create_description_buffer = cx.new(|cx| Buffer::local("", cx));
+
             let mut subscriptions = Vec::new();
+            subscriptions.push(cx.observe(&create_title_buffer, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&create_description_buffer, |_, _, cx| cx.notify()));
             subscriptions.push(cx.observe(
                 &workspace_entity,
                 |this: &mut PullRequestPanel, workspace, cx| {
@@ -211,6 +221,12 @@ impl PullRequestPanel {
                 sort_direction: PullRequestSortDirection::default(),
                 view_state: PullRequestPanelViewState::loading(),
                 collapsed_sections: Self::default_collapsed_sections(),
+
+                show_create_panel: false,
+                create_pull_request: create_pull_request_panel::CreatePullRequestState::new(
+                    create_title_buffer,
+                    create_description_buffer,
+                ),
             }
         });
 
@@ -290,6 +306,167 @@ impl PullRequestPanel {
                 }));
             }
         }
+    }
+
+    fn toggle_create_pull_request_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_create_panel {
+            self.hide_create_pull_request_panel(cx);
+            return;
+        }
+
+        let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
+            return;
+        };
+
+        self.show_create_panel = true;
+        create_pull_request_panel::initialize_create_panel_defaults(
+            &mut self.create_pull_request,
+            data,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn hide_create_pull_request_panel(&mut self, cx: &mut Context<Self>) {
+        self.show_create_panel = false;
+        self.create_pull_request.error_message.take();
+        self.create_pull_request.create_task_in_flight = false;
+        cx.notify();
+    }
+
+    fn set_selected_branch(
+        &mut self,
+        role: create_pull_request_panel::BranchRole,
+        branch: create_pull_request_panel::SelectedBranch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match role {
+            create_pull_request_panel::BranchRole::Base => {
+                self.create_pull_request.base_branch = Some(branch);
+            }
+            create_pull_request_panel::BranchRole::Head => {
+                self.create_pull_request.head_branch = Some(branch);
+            }
+        }
+        self.create_pull_request.error_message.take();
+        cx.notify();
+    }
+
+    fn create_pull_request(&mut self, draft: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
+            return;
+        };
+
+        let Some(token) = PullRequestPanelGitHubSettings::get_global(cx)
+            .github_token
+            .clone()
+        else {
+            self.create_pull_request.error_message =
+                Some("Missing GitHub token. Set `git.github_token` in your Zed settings.".into());
+            cx.notify();
+            return;
+        };
+
+        let title = self.create_pull_request.title_text(cx);
+        if title.trim().is_empty() {
+            self.create_pull_request.error_message = Some("Title is required.".into());
+            cx.notify();
+            return;
+        }
+
+        let Some(base) = self.create_pull_request.base_branch.as_ref() else {
+            self.create_pull_request.error_message = Some("Select a base branch.".into());
+            cx.notify();
+            return;
+        };
+        let Some(head) = self.create_pull_request.head_branch.as_ref() else {
+            self.create_pull_request.error_message = Some("Select a branch to merge.".into());
+            cx.notify();
+            return;
+        };
+
+        if base.api_ref == head.api_ref {
+            self.create_pull_request.error_message =
+                Some("Base and head branches must be different.".into());
+            cx.notify();
+            return;
+        }
+
+        if self.create_pull_request.create_task_in_flight {
+            return;
+        }
+
+        let description = self.create_pull_request.description_text(cx);
+        let body = if description.trim().is_empty() {
+            None
+        } else {
+            Some(description)
+        };
+
+        let github_repository = data.repository.clone();
+        let token = token;
+        let base = base.api_ref.to_string();
+        let head = head.api_ref.to_string();
+        let title = title;
+
+        self.create_pull_request.create_task_in_flight = true;
+        self.create_pull_request.error_message.take();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let http_client = cx.update(|cx| cx.http_client());
+                let request = github_create_pull_request_request(
+                    &github_repository,
+                    &token,
+                    GitHubCreatePullRequestRequestBody {
+                        title,
+                        head,
+                        base,
+                        body,
+                        draft,
+                    },
+                    &http_client,
+                )?;
+
+                let mut response = http_client.send(request).await?;
+                let status = response.status();
+                let body_bytes = read_response_body(response.body_mut()).await?;
+
+                if status == StatusCode::UNPROCESSABLE_ENTITY {
+                    if let Some(message) = github_first_validation_error_message(&body_bytes) {
+                        bail!("{message}");
+                    }
+
+                    let body_text = String::from_utf8_lossy(&body_bytes);
+                    bail!("GitHub pull request creation failed with status {status}: {body_text}");
+                } else if status != StatusCode::CREATED {
+                    let body_text = String::from_utf8_lossy(&body_bytes);
+                    bail!("GitHub pull request creation failed with status {status}: {body_text}");
+                }
+
+                anyhow::Ok(())
+            }
+            .await;
+
+            this.update(cx, |panel, cx| {
+                panel.create_pull_request.create_task_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        panel.create_pull_request.clear_inputs(cx);
+                        panel.show_create_panel = false;
+                        panel.reload(cx);
+                    }
+                    Err(error) => {
+                        panel.create_pull_request.error_message = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_section_expanded(
@@ -507,11 +684,7 @@ impl PullRequestPanel {
         cx.notify();
     }
 
-    fn checkout_branch_action_disabled(
-        &self,
-        pull_request: &PullRequestSummary,
-        cx: &App,
-    ) -> bool {
+    fn checkout_branch_action_disabled(&self, pull_request: &PullRequestSummary, cx: &App) -> bool {
         let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
             return false;
         };
@@ -577,6 +750,22 @@ impl PullRequestPanel {
         });
 
         cx.notify();
+    }
+}
+
+#[derive(Clone, Debug, Default, RegisterSetting)]
+struct PullRequestPanelGitHubSettings {
+    github_token: Option<String>,
+}
+
+impl Settings for PullRequestPanelGitHubSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            github_token: content
+                .git
+                .as_ref()
+                .and_then(|git| git.github_token.clone()),
+        }
     }
 }
 
@@ -849,6 +1038,16 @@ struct GitHubRepositoryContext {
     api_base_url: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct GitHubCreatePullRequestRequestBody {
+    title: String,
+    head: String,
+    base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    draft: bool,
+}
+
 #[derive(Clone)]
 struct PullRequestLoadContext {
     repository: Entity<Repository>,
@@ -956,6 +1155,32 @@ struct GitHubPullRequestHeadResponse {
 struct GitHubPullRequestBaseResponse {
     #[serde(rename = "ref")]
     reference: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubValidationFailedResponse {
+    message: String,
+    #[serde(default)]
+    errors: Vec<GitHubValidationFailedItem>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubValidationFailedItem {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn github_first_validation_error_message(body: &[u8]) -> Option<String> {
+    let response: GitHubValidationFailedResponse = serde_json::from_slice(body).ok()?;
+    if let Some(first) = response
+        .errors
+        .into_iter()
+        .next()
+        .and_then(|error| error.message)
+    {
+        return Some(first);
+    }
+    (!response.message.trim().is_empty()).then_some(response.message)
 }
 
 fn active_repository_id_for_workspace(workspace: &Workspace, cx: &App) -> Option<EntityId> {
@@ -1151,6 +1376,51 @@ fn github_pull_request_request(
         .follow_redirects(RedirectPolicy::FollowAll)
         .body(AsyncBody::default())
         .context("Failed to build GitHub pull request request")
+}
+
+fn github_create_pull_request_request_body(
+    body: GitHubCreatePullRequestRequestBody,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec(&body)
+        .map_err(|error| anyhow!("Failed to serialize create PR request: {error}"))
+}
+
+fn github_create_pull_request_request(
+    repository: &GitHubRepositoryContext,
+    token: &str,
+    body: GitHubCreatePullRequestRequestBody,
+    http_client: &Arc<dyn HttpClient>,
+) -> Result<Request<AsyncBody>> {
+    let body_bytes = github_create_pull_request_request_body(body)?;
+    let body = AsyncBody::from(body_bytes);
+
+    Request::builder()
+        .method("POST")
+        .uri(format!(
+            "{}/repos/{}/{}/pulls",
+            repository.api_base_url, repository.owner, repository.repo
+        ))
+        .header("Accept", GITHUB_ACCEPT_HEADER)
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .when_some(http_client.user_agent().cloned(), |request, user_agent| {
+            request.header("User-Agent", user_agent)
+        })
+        .follow_redirects(RedirectPolicy::FollowAll)
+        .body(body)
+        .context("Failed to build GitHub create pull request request")
+}
+
+pub(crate) fn branch_api_ref(branch: &Branch) -> String {
+    let name = branch.name();
+    if branch.is_remote() {
+        name.split_once('/')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_else(|| name.to_string())
+    } else {
+        name.to_string()
+    }
 }
 
 fn response_has_next_page(response: &http_client::Response<AsyncBody>) -> Result<bool> {
@@ -1610,8 +1880,8 @@ mod tests {
     }
 
     #[test]
-    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different(
-    ) {
+    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different()
+     {
         assert!(!current_branch_matches_pull_request_head(
             "feature/topic",
             Some(&branch("refs/heads/main")),
@@ -1714,6 +1984,114 @@ mod tests {
                 None,
             ),
             Some(PullRequestContextMenuEffect::RefreshPullRequest)
+        );
+    }
+
+    #[test]
+    fn remote_branch_api_ref_strips_remote_prefix_only_for_remote_refs() {
+        let remote = Branch {
+            is_head: false,
+            ref_name: "refs/remotes/origin/feature/x".to_string().into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+        let local = Branch {
+            is_head: false,
+            ref_name: "refs/heads/feature/x".to_string().into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+
+        assert_eq!(branch_api_ref(&remote), "feature/x");
+        assert_eq!(branch_api_ref(&local), "feature/x");
+    }
+
+    #[test]
+    fn request_body_sets_draft_and_omits_empty_body() {
+        let body_bytes =
+            github_create_pull_request_request_body(GitHubCreatePullRequestRequestBody {
+                title: "Title".to_string(),
+                head: "feature".to_string(),
+                base: "main".to_string(),
+                body: None,
+                draft: true,
+            })
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(value.get("draft").and_then(|v| v.as_bool()), Some(true));
+        assert!(value.get("body").is_none());
+    }
+
+    #[test]
+    fn github_create_pull_request_request_builds_expected_request() {
+        let repository = GitHubRepositoryContext {
+            owner: "zed-industries".to_string(),
+            repo: "zed".to_string(),
+            full_name: "zed-industries/zed".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+        };
+        let http_client: Arc<dyn HttpClient> = Arc::new(http_client::BlockedHttpClient::new());
+
+        let request = github_create_pull_request_request(
+            &repository,
+            "token",
+            GitHubCreatePullRequestRequestBody {
+                title: "Title".to_string(),
+                head: "feature".to_string(),
+                base: "main".to_string(),
+                body: Some("Body".to_string()),
+                draft: false,
+            },
+            &http_client,
+        )
+        .unwrap();
+
+        assert_eq!(*request.method(), http_client::Method::POST);
+        assert_eq!(request.uri().path(), "/repos/zed-industries/zed/pulls");
+        assert_eq!(
+            request
+                .headers()
+                .get("Accept")
+                .and_then(|header| header.to_str().ok()),
+            Some(GITHUB_ACCEPT_HEADER)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-GitHub-Api-Version")
+                .and_then(|header| header.to_str().ok()),
+            Some(GITHUB_API_VERSION)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Content-Type")
+                .and_then(|header| header.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|header| header.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    #[test]
+    fn github_first_validation_error_message_prefers_first_error_message() {
+        let body = br#"{
+            "message": "Validation Failed",
+            "errors": [
+                { "message": "No commits between main and feature" },
+                { "message": "Some other error" }
+            ]
+        }"#;
+
+        assert_eq!(
+            github_first_validation_error_message(body),
+            Some("No commits between main and feature".to_string())
         );
     }
 }
