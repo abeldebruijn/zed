@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Context, MouseDownEvent, StatefulInteractiveElement, Window};
+use gpui::{AnyElement, ClickEvent, Context, MouseDownEvent, StatefulInteractiveElement, Window};
 use ui::{
     Button, ButtonCommon, ButtonStyle, Color, Label, LabelSize, ListHeader, ListItem, prelude::*,
     v_flex,
@@ -239,10 +239,14 @@ fn render_pull_request_row(
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
     let context_menu_pull_request = pull_request.clone();
+    let selected_pull_request = pull_request.clone();
 
     ListItem::new(format!("{}-pr-{}", section.id(), pull_request.number))
         .inset(true)
         .indent_level(1)
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.open_pull_request_details(selected_pull_request.clone(), window, cx);
+        }))
         .on_secondary_mouse_down(
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
