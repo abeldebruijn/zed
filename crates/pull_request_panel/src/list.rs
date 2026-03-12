@@ -8,6 +8,7 @@ use crate::{
     CategorizedPullRequests, PullRequestPanel, PullRequestPanelContent, PullRequestPanelData,
     PullRequestSummary,
 };
+use crate::create_pull_request_panel;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum PullRequestSection {
@@ -86,14 +87,14 @@ fn ready_state_list_items(show_load_more_button: bool) -> Vec<ReadyStateListItem
 
 pub(super) fn render_content(
     panel: &PullRequestPanel,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
     match &panel.view_state.content {
         PullRequestPanelContent::Loading => render_loading_state(),
         PullRequestPanelContent::Empty { message } => render_message_state(message),
         PullRequestPanelContent::Error { message } => render_message_state(message),
-        PullRequestPanelContent::Ready(data) => render_ready_state(panel, data, cx),
+        PullRequestPanelContent::Ready(data) => render_ready_state(panel, data, window, cx),
     }
 }
 
@@ -129,6 +130,7 @@ fn render_message_state(message: &str) -> AnyElement {
 fn render_ready_state(
     panel: &PullRequestPanel,
     data: &PullRequestPanelData,
+    window: &mut Window,
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
     let visible_sections = data.visible_sections(panel.visible_pull_request_count);
@@ -148,6 +150,14 @@ fn render_ready_state(
             .size(LabelSize::Small)
             .color(Color::Muted),
         )
+        .when(panel.show_create_panel, |this| {
+            this.child(create_pull_request_panel::render_create_pull_request_panel(
+                panel,
+                data,
+                window,
+                cx,
+            ))
+        })
         .child(
             div()
                 .id("pull-request-panel-list-scroll")
