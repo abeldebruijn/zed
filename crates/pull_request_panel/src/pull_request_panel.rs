@@ -307,11 +307,7 @@ impl PullRequestPanel {
         }
     }
 
-    fn toggle_create_pull_request_panel(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn toggle_create_pull_request_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.show_create_panel {
             self.hide_create_pull_request_panel(cx);
             return;
@@ -361,11 +357,12 @@ impl PullRequestPanel {
             return;
         };
 
-        let Some(token) = PullRequestPanelGitHubSettings::get_global(cx).github_token.clone()
+        let Some(token) = PullRequestPanelGitHubSettings::get_global(cx)
+            .github_token
+            .clone()
         else {
-            self.create_pull_request.error_message = Some(
-                "Missing GitHub token. Set `git.github_token` in your Zed settings.".into(),
-            );
+            self.create_pull_request.error_message =
+                Some("Missing GitHub token. Set `git.github_token` in your Zed settings.".into());
             cx.notify();
             return;
         };
@@ -436,11 +433,16 @@ impl PullRequestPanel {
                 let status = response.status();
                 let body_bytes = read_response_body(response.body_mut()).await?;
 
-                if status != StatusCode::CREATED {
+                if status == StatusCode::UNPROCESSABLE_ENTITY {
+                    if let Some(message) = github_first_validation_error_message(&body_bytes) {
+                        bail!("{message}");
+                    }
+
                     let body_text = String::from_utf8_lossy(&body_bytes);
-                    bail!(
-                        "GitHub pull request creation failed with status {status}: {body_text}"
-                    );
+                    bail!("GitHub pull request creation failed with status {status}: {body_text}");
+                } else if status != StatusCode::CREATED {
+                    let body_text = String::from_utf8_lossy(&body_bytes);
+                    bail!("GitHub pull request creation failed with status {status}: {body_text}");
                 }
 
                 anyhow::Ok(())
@@ -456,8 +458,7 @@ impl PullRequestPanel {
                         panel.reload(cx);
                     }
                     Err(error) => {
-                        panel.create_pull_request.error_message =
-                            Some(error.to_string().into());
+                        panel.create_pull_request.error_message = Some(error.to_string().into());
                         cx.notify();
                     }
                 }
@@ -682,11 +683,7 @@ impl PullRequestPanel {
         cx.notify();
     }
 
-    fn checkout_branch_action_disabled(
-        &self,
-        pull_request: &PullRequestSummary,
-        cx: &App,
-    ) -> bool {
+    fn checkout_branch_action_disabled(&self, pull_request: &PullRequestSummary, cx: &App) -> bool {
         let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
             return false;
         };
@@ -719,7 +716,10 @@ struct PullRequestPanelGitHubSettings {
 impl Settings for PullRequestPanelGitHubSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self {
-            github_token: content.git.as_ref().and_then(|git| git.github_token.clone()),
+            github_token: content
+                .git
+                .as_ref()
+                .and_then(|git| git.github_token.clone()),
         }
     }
 }
@@ -1112,6 +1112,32 @@ struct GitHubPullRequestBaseResponse {
     reference: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct GitHubValidationFailedResponse {
+    message: String,
+    #[serde(default)]
+    errors: Vec<GitHubValidationFailedItem>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GitHubValidationFailedItem {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn github_first_validation_error_message(body: &[u8]) -> Option<String> {
+    let response: GitHubValidationFailedResponse = serde_json::from_slice(body).ok()?;
+    if let Some(first) = response
+        .errors
+        .into_iter()
+        .next()
+        .and_then(|error| error.message)
+    {
+        return Some(first);
+    }
+    (!response.message.trim().is_empty()).then_some(response.message)
+}
+
 fn active_repository_id_for_workspace(workspace: &Workspace, cx: &App) -> Option<EntityId> {
     resolve_active_repository(workspace, cx).map(|repository| repository.entity_id())
 }
@@ -1310,7 +1336,8 @@ fn github_pull_request_request(
 fn github_create_pull_request_request_body(
     body: GitHubCreatePullRequestRequestBody,
 ) -> Result<Vec<u8>> {
-    serde_json::to_vec(&body).map_err(|error| anyhow!("Failed to serialize create PR request: {error}"))
+    serde_json::to_vec(&body)
+        .map_err(|error| anyhow!("Failed to serialize create PR request: {error}"))
 }
 
 fn github_create_pull_request_request(
@@ -1320,6 +1347,7 @@ fn github_create_pull_request_request(
     http_client: &Arc<dyn HttpClient>,
 ) -> Result<Request<AsyncBody>> {
     let body_bytes = github_create_pull_request_request_body(body)?;
+    let body = AsyncBody::from(body_bytes);
 
     Request::builder()
         .method("POST")
@@ -1335,7 +1363,7 @@ fn github_create_pull_request_request(
             request.header("User-Agent", user_agent)
         })
         .follow_redirects(RedirectPolicy::FollowAll)
-        .body(AsyncBody::from(body_bytes))
+        .body(body)
         .context("Failed to build GitHub create pull request request")
 }
 
@@ -1807,8 +1835,8 @@ mod tests {
     }
 
     #[test]
-    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different(
-    ) {
+    fn current_branch_matches_pull_request_head_leaves_checkout_enabled_when_branch_is_unknown_or_different()
+     {
         assert!(!current_branch_matches_pull_request_head(
             "feature/topic",
             Some(&branch("refs/heads/main")),
@@ -1935,14 +1963,15 @@ mod tests {
 
     #[test]
     fn request_body_sets_draft_and_omits_empty_body() {
-        let body_bytes = github_create_pull_request_request_body(GitHubCreatePullRequestRequestBody {
-            title: "Title".to_string(),
-            head: "feature".to_string(),
-            base: "main".to_string(),
-            body: None,
-            draft: true,
-        })
-        .unwrap();
+        let body_bytes =
+            github_create_pull_request_request_body(GitHubCreatePullRequestRequestBody {
+                title: "Title".to_string(),
+                head: "feature".to_string(),
+                base: "main".to_string(),
+                body: None,
+                draft: true,
+            })
+            .unwrap();
 
         let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(value.get("draft").and_then(|v| v.as_bool()), Some(true));
@@ -1974,10 +2003,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(*request.method(), http_client::Method::POST);
-        assert_eq!(
-            request.uri().path(),
-            "/repos/zed-industries/zed/pulls"
-        );
+        assert_eq!(request.uri().path(), "/repos/zed-industries/zed/pulls");
         assert_eq!(
             request
                 .headers()
@@ -2005,6 +2031,22 @@ mod tests {
                 .get("Authorization")
                 .and_then(|header| header.to_str().ok()),
             Some("Bearer token")
+        );
+    }
+
+    #[test]
+    fn github_first_validation_error_message_prefers_first_error_message() {
+        let body = br#"{
+            "message": "Validation Failed",
+            "errors": [
+                { "message": "No commits between main and feature" },
+                { "message": "Some other error" }
+            ]
+        }"#;
+
+        assert_eq!(
+            github_first_validation_error_message(body),
+            Some("No commits between main and feature".to_string())
         );
     }
 }

@@ -312,6 +312,7 @@ fn render_editor_field(
     cx: &mut Context<PullRequestPanel>,
 ) -> AnyElement {
     let settings = theme::ThemeSettings::get_global(cx);
+    let input_background = cx.theme().colors().toolbar_background;
     let text_style = gpui::TextStyle {
         color: cx.theme().colors().text,
         font_family: settings.buffer_font.family.clone(),
@@ -324,7 +325,8 @@ fn render_editor_field(
     };
 
     let mut editor_style = EditorStyle {
-        background: cx.theme().colors().surface_background,
+        // Match the container background so the padding area stays the same dark color.
+        background: input_background,
         local_player: cx.theme().players().local(),
         text: text_style,
         ..EditorStyle::default()
@@ -343,6 +345,7 @@ fn render_editor_field(
         .min_w_32()
         .px_2()
         .py_1()
+        .bg(input_background)
         .border_1()
         .border_color(border_color)
         .rounded_md()
