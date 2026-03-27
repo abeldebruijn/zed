@@ -13473,6 +13473,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "pull_request_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "client",
+ "editor",
+ "futures 0.3.31",
+ "git",
+ "git_ui",
+ "gpui",
+ "http_client",
+ "markdown",
+ "language",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "ui",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21872,6 +21897,7 @@ dependencies = [
  "project_symbols",
  "prompt_store",
  "proto",
+ "pull_request_panel",
  "rayon",
  "recent_projects",
  "release_channel",
