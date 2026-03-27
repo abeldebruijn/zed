@@ -23,6 +23,7 @@ use workspace::{
 
 mod create_pull_request_panel;
 mod list;
+mod pull_request_details_view;
 mod pull_request_context_panel;
 mod top_bar;
 
@@ -705,6 +706,50 @@ impl PullRequestPanel {
     fn clear_context_menu(&mut self) {
         self.context_menu_pull_request.take();
         self.context_menu.take();
+    }
+
+    fn open_pull_request_details(
+        &mut self,
+        pull_request: PullRequestSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_context_menu();
+
+        let PullRequestPanelContent::Ready(data) = &self.view_state.content else {
+            return;
+        };
+        let github_repository = data.repository.clone();
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            let existing = workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<pull_request_details_view::PullRequestDetailsView>());
+
+            if let Some(existing) = existing {
+                workspace.activate_item(&existing, true, true, window, cx);
+                existing.update(cx, |details_view, cx| {
+                    details_view.set_pull_request(github_repository, pull_request, cx);
+                });
+            } else {
+                let details_view = cx.new(|cx| {
+                    pull_request_details_view::PullRequestDetailsView::new(
+                        github_repository,
+                        pull_request,
+                        cx,
+                    )
+                });
+                workspace.add_item_to_active_pane(Box::new(details_view), None, true, window, cx);
+            }
+        });
+
+        cx.notify();
     }
 }
 

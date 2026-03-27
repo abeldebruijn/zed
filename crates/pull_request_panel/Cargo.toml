@@ -21,6 +21,7 @@ git.workspace = true
 git_ui.workspace = true
 gpui.workspace = true
 http_client.workspace = true
+markdown.workspace = true
 language.workspace = true
 project.workspace = true
 serde.workspace = true

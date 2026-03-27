@@ -13485,6 +13485,7 @@ dependencies = [
  "git_ui",
  "gpui",
  "http_client",
+ "markdown",
  "language",
  "project",
  "serde",
